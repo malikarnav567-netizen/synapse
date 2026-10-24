@@ -1,22 +1,10 @@
 {
-  "builds": [
-    {
-      "src": "dist/index.html",
-      "use": "@vercel/redirect"
-    },
-    {
-      "src": "server/index.ts",
-      "use": "@vercel/node"
-    }
-  ],
-  "routes": [
-    {
-      "src": "/api/(.*)",
-      "dest": "server/index.ts"
-    },
-    {
-      "src": "/(.*)",
-      "dest": "dist/index.html"
-    }
+  "$schema": "https://openapi.vercel.sh/vercel.json",
+  "framework": null,
+  "installCommand": "npm install --prefix red-sea-resilience",
+  "buildCommand": "npm run build --prefix red-sea-resilience",
+  "outputDirectory": "red-sea-resilience/dist",
+  "rewrites": [
+    { "source": "/((?!api/).*)", "destination": "/index.html" }
   ]
 }

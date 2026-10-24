@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState, useSyncExternalStore } from 'react';
+import { useCallback, useEffect, useRef, useState, useSyncExternalStore } from 'react';
 import maplibregl from 'maplibre-gl';
 import 'maplibre-gl/dist/maplibre-gl.css';
 
@@ -142,100 +142,178 @@ const vesselCollection = (net: any) => ({
 });
 
 const MAPTILER_KEY = (import.meta as any).env?.VITE_MAPLIBRE_KEY as string | undefined;
+// Keyless fallbacks so the globe still renders when the MapTiler key is rejected.
+const FALLBACK_STYLE = 'https://basemaps.cartocdn.com/gl/dark-matter-gl-style/style.json';
+const SCHEMATIC_STYLE: any = {
+  version: 8,
+  sources: {},
+  layers: [{ id: 'bg', type: 'background', paint: { 'background-color': '#05070c' } }],
+};
 
-function GlobePanel({ network }: { network: any }) {
+function GlobePanel({ network, onReady }: { network: any; onReady?: () => void }) {
   const holder = useRef<HTMLDivElement>(null);
   const mapRef = useRef<maplibregl.Map | null>(null);
   const netRef = useRef(network);
-  const [note, setNote] = useState(MAPTILER_KEY ? 'Loading globe…' : 'No VITE_MAPLIBRE_KEY — showing schematic');
+  const readyRef = useRef(false);
+  const onReadyRef = useRef(onReady);
+  const [note, setNote] = useState('Loading globe…');
+
+  onReadyRef.current = onReady;
 
   netRef.current = network;
 
   useEffect(() => {
-    if (!holder.current || mapRef.current) return;
+    const holderEl = holder.current;
+    if (!holderEl || mapRef.current) return;
 
-    const style: any = MAPTILER_KEY
-      ? `https://api.maptiler.com/maps/basic/style.json?key=${MAPTILER_KEY}`
-      : {
-          version: 8,
-          sources: {},
-          layers: [{ id: 'bg', type: 'background', paint: { 'background-color': '#05070c' } }],
-        };
+    let disposed = false;
+    let map: maplibregl.Map | null = null;
+    let resize: (() => void) | null = null;
+    let ro: ResizeObserver | null = null;
+    let readyTimer: number | undefined;
 
-    let map: maplibregl.Map;
-    try {
-      map = new maplibregl.Map({
-        container: holder.current,
-        style,
-        center: [40, 19],
-        zoom: 1.55,
-        pitch: 28,
-        bearing: 0,
-        antialias: true,
-        attributionControl: { compact: true },
-      });
-    } catch {
-      setNote('WebGL unavailable — schematic only');
-      return;
-    }
-
-    mapRef.current = map;
-    map.addControl(new maplibregl.NavigationControl({ visualizePitch: true }), 'bottom-right');
-
-    let failed = false;
-    map.on('error', () => {
-      if (failed) return;
-      failed = true;
-      setNote(MAPTILER_KEY ? 'Map tiles unavailable — check VITE_MAPLIBRE_KEY' : 'Schematic only');
-    });
-
-    map.on('load', () => {
-      setNote('');
+    // Check the MapTiler style before the map exists: calling setStyle while a
+    // style is still loading leaves MapLibre stuck and 'style.load' never fires.
+    const preflight = async (): Promise<any> => {
+      if (!MAPTILER_KEY) return FALLBACK_STYLE;
       try {
-        (map as any).setProjection({ type: 'globe' });
+        const r = await fetch(`https://api.maptiler.com/maps/basic/style.json?key=${MAPTILER_KEY}`, { signal: AbortSignal.timeout(5000) });
+        return r.ok ? `https://api.maptiler.com/maps/basic/style.json?key=${MAPTILER_KEY}` : FALLBACK_STYLE;
       } catch {
-        /* older maplibre builds: flat map */
+        return FALLBACK_STYLE;
+      }
+    };
+
+    const installLayers = () => {
+      if (!map) return;
+      if (!map.getSource('lanes')) {
+        map.addSource('lanes', { type: 'geojson', data: laneCollection(netRef.current) as any });
+        map.addLayer({
+          id: 'lanes-glow',
+          type: 'line',
+          source: 'lanes',
+          layout: { 'line-join': 'round', 'line-cap': 'round' },
+          paint: { 'line-color': '#00ffaa', 'line-width': 7, 'line-opacity': 0.16, 'line-blur': 4 },
+        });
+        map.addLayer({
+          id: 'lanes',
+          type: 'line',
+          source: 'lanes',
+          layout: { 'line-join': 'round', 'line-cap': 'round' },
+          paint: {
+            'line-color': ['match', ['get', 'status'], 'rerouted', '#E8FF1F', '#00ffaa'],
+            'line-width': 2,
+            'line-opacity': 0.9,
+          },
+        });
       }
 
-      map.addSource('lanes', { type: 'geojson', data: laneCollection(netRef.current) as any });
-      map.addLayer({
-        id: 'lanes-glow',
-        type: 'line',
-        source: 'lanes',
-        layout: { 'line-join': 'round', 'line-cap': 'round' },
-        paint: { 'line-color': '#00ffaa', 'line-width': 7, 'line-opacity': 0.16, 'line-blur': 4 },
-      });
-      map.addLayer({
-        id: 'lanes',
-        type: 'line',
-        source: 'lanes',
-        layout: { 'line-join': 'round', 'line-cap': 'round' },
-        paint: {
-          'line-color': ['match', ['get', 'status'], 'rerouted', '#E8FF1F', '#00ffaa'],
-          'line-width': 2,
-          'line-opacity': 0.9,
-        },
+      if (!map.getSource('vessels')) {
+        map.addSource('vessels', { type: 'geojson', data: vesselCollection(netRef.current) as any });
+        map.addLayer({
+          id: 'vessels',
+          type: 'circle',
+          source: 'vessels',
+          paint: {
+            'circle-color': ['match', ['get', 'route'], 'cape', '#E8FF1F', '#ff6b6b'],
+            'circle-radius': 4.5,
+            'circle-stroke-color': '#ffffff',
+            'circle-stroke-width': 1,
+          },
+        });
+      }
+    };
+
+    const markReady = () => {
+      if (readyRef.current) return;
+      readyRef.current = true;
+      window.clearTimeout(readyTimer);
+      onReadyRef.current?.();
+    };
+
+    const create = (style: any) => {
+      if (disposed) return;
+      try {
+        map = new maplibregl.Map({
+          container: holderEl,
+          style,
+          center: [40, 19],
+          zoom: 1.55,
+          pitch: 28,
+          bearing: 0,
+          maxPitch: 85,
+          canvasContextAttributes: { antialias: true },
+          attributionControl: { compact: true },
+        });
+      } catch {
+        setNote('WebGL unavailable — schematic only');
+        return;
+      }
+
+      mapRef.current = map;
+      map.addControl(new maplibregl.NavigationControl({ visualizePitch: true }), 'bottom-right');
+
+      let fellBackToSchematic = false;
+      map.on('error', () => {
+        // Tiles can fail after the style is live; that is not fatal.
+        if (!map || map.isStyleLoaded() || fellBackToSchematic) return;
+        fellBackToSchematic = true;
+        setNote('Basemap unavailable — schematic view');
+        // Wait for the failed load to settle: swapping mid-load wedges MapLibre.
+        window.setTimeout(() => {
+          if (!disposed && map && !map.isStyleLoaded()) map.setStyle(SCHEMATIC_STYLE);
+        }, 1200);
       });
 
-      map.addSource('vessels', { type: 'geojson', data: vesselCollection(netRef.current) as any });
-      map.addLayer({
-        id: 'vessels',
-        type: 'circle',
-        source: 'vessels',
-        paint: {
-          'circle-color': ['match', ['get', 'route'], 'cape', '#E8FF1F', '#ff6b6b'],
-          'circle-radius': 4.5,
-          'circle-stroke-color': '#ffffff',
-          'circle-stroke-width': 1,
-        },
+      map.on('style.load', () => {
+        if (!map) return;
+        setNote(style === SCHEMATIC_STYLE ? 'Schematic view' : '');
+        try {
+          (map as any).setProjection({ type: 'globe' });
+          // Atmosphere sells the sphere; ignored by older builds.
+          (map as any).setSky?.({
+            'sky-color': '#0a1224',
+            'horizon-color': '#1b2a4a',
+            'fog-color': '#05070c',
+            'sky-horizon-blend': 0.6,
+            'horizon-fog-blend': 0.55,
+            'fog-ground-blend': 0.9,
+          });
+        } catch {
+          /* older maplibre builds: flat map */
+        }
+        installLayers();
+        // Settle the camera so the globe reads as a sphere inside the card.
+        map.easeTo({ pitch: 28, duration: 0 });
+        markReady();
       });
+    };
 
-      // Settle the camera so the globe reads as a sphere inside the card.
-      map.easeTo({ pitch: 28, duration: 0 });
-    });
+    void (async () => {
+      const style = await preflight();
+      if (disposed) return;
+      create(style);
+      // Never leave the demo locked if a style silently stalls.
+      readyTimer = window.setTimeout(() => {
+        if (!readyRef.current && map?.getCanvas()) {
+          setNote(note => note || 'Basemap loading — schematic lanes only');
+          markReady();
+        }
+      }, 9000);
+    })();
+
+    // The card is responsive; keep the canvas in sync when the layout changes.
+    resize = () => mapRef.current?.resize();
+    window.addEventListener('resize', resize);
+    ro = typeof ResizeObserver !== 'undefined' ? new ResizeObserver(() => resize?.()) : null;
+    ro?.observe(holderEl);
 
     return () => {
-      map.remove();
+      disposed = true;
+      window.clearTimeout(readyTimer);
+      if (resize) window.removeEventListener('resize', resize);
+      ro?.disconnect();
+      map?.remove();
       mapRef.current = null;
     };
   }, []);
@@ -252,8 +330,9 @@ function GlobePanel({ network }: { network: any }) {
   return (
     <section className="card mapcard">
       <div ref={holder} className="map" />
+      <div className="mapbadge mono">Demo fleet · AIS simulated</div>
       <div className="mapnote mono">{note}</div>
-                <button onClick={() => window.open(window.location.href, "_blank")}>🗖</button>
+      <button className="mapopen" onClick={() => window.open(window.location.href, '_blank')} aria-label="Open in new tab">🗖</button>
       <div className="rim" />
     </section>
   );
@@ -269,10 +348,14 @@ export default function App() {
   const idle = phase === 'IDLE';
 
   const [ready, setReady] = useState(false);
+  const [mapReady, setMapReady] = useState(false);
   const [shown, setShown] = useState(false);
   const [credits, setCredits] = useState('—');
   const fired = useRef(false);
   const feed = useRef<HTMLDivElement>(null);
+  const handleMapReady = useCallback(() => setMapReady(true), []);
+  // Simulations wait for the probe and the first map style so lanes exist first.
+  const armed = ready && mapReady;
 
   useEffect(() => {
     probe().finally(() => setReady(true));
@@ -282,10 +365,10 @@ export default function App() {
 
   // ?simulate fires once, only when ready (no cleanup: StrictMode double-runs effects)
   useEffect(() => {
-    if (!ready || fired.current || !location.search.includes('simulate')) return;
+    if (!armed || fired.current || !location.search.includes('simulate')) return;
     fired.current = true;
     setTimeout(() => useNet.getState().simulate(), 1500);
-  }, [ready]);
+  }, [armed]);
 
   useEffect(() => {
     if (!ready || status === 'NOT_CONFIGURED') return;
@@ -307,7 +390,7 @@ export default function App() {
   const conf = useCount((d?.confidence ?? 0) * 100);
 
   const evidence = [...(d?.evidence ?? []), ...s.extra].filter((e: any) => e.sourceUrl && e.retrievedAt);
-  const label = status === 'CONNECTED' ? 'Live' : status === 'DEGRADED' ? 'Degraded' : status === 'OFFLINE' ? 'Offline' : 'Local fallback';
+  const label = status === 'CONNECTED' ? 'Live' : status === 'DEGRADED' ? 'Degraded' : 'Local Fallback';
   const order = AGENTS.map((a: string) => events.some((e: any) => e.agent === a));
   const latest = order.lastIndexOf(true);
   const PH: Record<string, string> = {
@@ -330,7 +413,7 @@ export default function App() {
           </h1>
           <div className="ctrls">
             <div className="seg" role="group" aria-label="Actions">
-              <button className="pri" disabled={phase !== 'IDLE'} onClick={() => s.simulate()}>
+              <button className="pri" disabled={phase !== 'IDLE' || !armed} onClick={() => s.simulate()} title={armed ? undefined : 'Waiting for map and status checks' }>
                 Simulate disruption
               </button>
               <button className="pri" disabled={phase !== 'AWAITING_APPROVAL'} onClick={() => s.approve()}>
@@ -341,15 +424,15 @@ export default function App() {
               </button>
             </div>
             <div className="seg">
-              <button disabled aria-label="TinyFish status">
-                TinyFish: {status.replace('_', ' ')}
+              <button disabled aria-label="TinyFish status" title={`TinyFish: ${status.replace('_', ' ')}`}>
+                TinyFish: {status === 'CONNECTED' ? 'Live' : status === 'DEGRADED' ? 'Degraded' : 'Local Fallback'}
               </button>
             </div>
           </div>
         </div>
 
         <div className="grid">
-          <GlobePanel network={network} />
+          <GlobePanel network={network} onReady={handleMapReady} />
 
           <Card id="feed" className="h1" tone="blue">
             <div className="row between">
@@ -401,6 +484,9 @@ export default function App() {
               </text>
               <text y="0" textAnchor="middle" fontSize="12" fontWeight="500" fill="rgba(255,255,255,.38)">
                 {sum?.degraded ? 'modelled' : 'evidence-backed'}
+              </text>
+              <text y="18" textAnchor="middle" fontSize="8.5" fontWeight="400" fill="rgba(255,255,255,.3)" className="mono">
+                .55 + .10·domains − .15·degraded
               </text>
             </svg>
             <div className="steps">
@@ -460,8 +546,11 @@ export default function App() {
           <Card id="evid" className="h3" tone="pink">
             <div className="row between">
               <div className="ttl">Evidence</div>
-              <span className="muted dark2">
-                {evidence.length} source{evidence.length === 1 ? '' : 's'}
+              <span className="chips">
+                {evidence.length > 0 && <span className="chip tfc">Live signal: confirmed</span>}
+                <span className="muted dark2">
+                  {evidence.length} source{evidence.length === 1 ? '' : 's'}
+                </span>
               </span>
             </div>
             <div className="scroll low">
@@ -518,7 +607,10 @@ export default function App() {
           <Card id="sys" className="h3" tone="green">
             <div className="row between">
               <div className="ttl">Fleet</div>
-              <span className="chip">Demo data</span>
+              <span className="chips">
+                <span className="chip demo">Demo fleet</span>
+                <span className="chip">{status === 'CONNECTED' ? 'Live TinyFish' : label}</span>
+              </span>
             </div>
             <div className="sysrow">
               <span className="cap">TinyFish</span>

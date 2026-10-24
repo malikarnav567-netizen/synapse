@@ -1,0 +1,28 @@
+# Dependencies and build output
+node_modules/
+dist/
+
+# Local tooling (vendored Node + Vercel CLI, ~26 MB)
+.tools/
+.freebuff/
+
+# Vercel local link/build state
+.vercel/
+
+# Secrets — .env.example is the only env file that belongs in git
+.env
+.env.local
+.env.development
+.env.production
+red-sea-resilience/.env
+red-sea-resilience/.env.local
+red-sea-resilience/.env.development
+red-sea-resilience/.env.production
+
+# Logs and local screenshots
+*.log
+screenshots/
+
+# Large local artifacts
+*.zip
+earth-*.png

@@ -32,12 +32,16 @@ const sleep = (ms: number, s?: AbortSignal) => new Promise<void>((res, rej) => {
   s?.addEventListener('abort', () => { clearTimeout(t); rej(new DOMException('aborted', 'AbortError')); });
 });
 
-export async function tf<T>(path: string, init: RequestInit & { timeoutMs?: number } = {}, signal?: AbortSignal): Promise<T> {
-  const timeout = AbortSignal.timeout(init.timeoutMs ?? 12_000);
+export async function tf<T>(path: string, init: RequestInit & { timeoutMs?: number; silent?: boolean } = {}, signal?: AbortSignal): Promise<T> {
+  const { timeoutMs, silent = false, ...rest } = init;
+  const timeout = AbortSignal.timeout(timeoutMs ?? 12_000);
   const sig = signal ? AbortSignal.any([signal, timeout]) : timeout;
+  // Optional background work (research, cancellation) must not drag the
+  // connection badge to DEGRADED when the upstream throttles it.
+  const note = (o: Outcome) => { if (!silent) record(o); };
   for (let attempt = 0; ; attempt++) {
     try {
-      const res = await fetch(BASE + path, { ...init, signal: sig, headers: { 'Content-Type': 'application/json', ...(init.headers ?? {}) } });
+      const res = await fetch(BASE + path, { ...rest, signal: sig, headers: { 'Content-Type': 'application/json', ...(rest.headers ?? {}) } });
       if (res.status === 503 && (await res.clone().text()).includes('NOT_CONFIGURED')) { setConfigured(false); throw new TFError(503, 'NOT_CONFIGURED'); }
       // Only 429 and 503 are worth retrying; 401/402/403 never are.
       if ((res.status === 429 || res.status === 503) && attempt < 2) {
@@ -45,12 +49,12 @@ export async function tf<T>(path: string, init: RequestInit & { timeoutMs?: numb
         await sleep(ra || 500 * 2 ** attempt + Math.random() * 250, sig);
         continue;
       }
-      record({ ok: res.ok, netFail: false });
+      note({ ok: res.ok, netFail: false });
       if (!res.ok) throw new TFError(res.status, await res.text());
       return (await res.json()) as T;
     } catch (e) {
       if (e instanceof TFError) throw e;
-      if (!signal?.aborted) record({ ok: false, netFail: true });
+      if (!signal?.aborted) note({ ok: false, netFail: true });
       throw e;
     }
   }
@@ -58,19 +62,29 @@ export async function tf<T>(path: string, init: RequestInit & { timeoutMs?: numb
 
 /* ---- services ---- */
 export interface SearchHit { title: string; snippet: string; url: string; date?: string; site_name?: string }
-export async function search(q: string, signal?: AbortSignal): Promise<SearchHit[]> {
-  const p = new URLSearchParams({ query: q, recency_minutes: '4320', domain_type: 'news', purpose: 'Find current shipping advisories about Red Sea transit for a cold-chain risk assessment' });
-  const r = await tf<{ results: SearchHit[] }>(`/search?${p}`, {}, signal);
+const SEARCH_PURPOSE = 'Find current shipping advisories about Red Sea transit for a cold-chain risk assessment';
+export async function search(
+  q: string,
+  signal?: AbortSignal,
+  opts: { news?: boolean; purpose?: string; recencyMinutes?: number | null } = {},
+): Promise<SearchHit[]> {
+  const p = new URLSearchParams({ query: q, purpose: opts.purpose ?? SEARCH_PURPOSE });
+  // Reference guidance (e.g. WHO storage rules) is not time-sensitive, so it can
+  // skip the recency window that would otherwise filter out official handbooks.
+  const recency = opts.recencyMinutes === undefined ? (opts.news ? 1440 : 10080) : opts.recencyMinutes;
+  if (recency != null) p.set('recency_minutes', String(recency));
+  if (opts.news) p.set('domain_type', 'news');
+  const r = await tf<{ results: SearchHit[] }>(`/search?${p}`, { timeoutMs: 10_000 }, signal);
   return r.results ?? [];
 }
 export interface Page { url: string; final_url: string; title: string|null; description: string|null; published_date: string|null; text: string|null }
 export interface FetchOut { results: Page[]; errors: { url: string; error: string }[] }
 export const getContents = (urls: string[], signal?: AbortSignal) =>
-  tf<FetchOut>('/fetch', { method: 'POST', timeoutMs: 20_000, body: JSON.stringify({ urls: urls.slice(0, 10), format: 'markdown', ttl: 0, per_url_timeout_ms: 8000 }) }, signal);
+  tf<FetchOut>('/fetch', { method: 'POST', timeoutMs: 18_000, body: JSON.stringify({ urls: urls.slice(0, 3), format: 'markdown', ttl: 0, per_url_timeout_ms: 5000 }) }, signal);
 
-export const startResearch = (query: string) => tf<{ research_run_id: string }>('/research/start', { method: 'POST', body: JSON.stringify({ query }) });
-export const getResearch = (id: string, signal?: AbortSignal) => tf<{ status: string; deep_result?: { result?: string; citations?: string[] } }>(`/research/${id}`, {}, signal);
-export const cancelResearch = (id: string) => tf(`/research/${id}/cancel`, { method: 'POST' }).catch(() => {});
+export const startResearch = (query: string) => tf<{ research_run_id: string }>('/research/start', { method: 'POST', body: JSON.stringify({ query }), silent: true });
+export const getResearch = (id: string, signal?: AbortSignal) => tf<{ status: string; deep_result?: { result?: string; citations?: string[] } }>(`/research/${id}`, { silent: true }, signal);
+export const cancelResearch = (id: string) => tf(`/research/${id}/cancel`, { method: 'POST', silent: true }).catch(() => {});
 export const wallet = () => tf<any>('/wallet');
 
 export async function runAgent<T>(url: string, goal: string, output_schema: object, signal: AbortSignal, onProgress: (m: string) => void, onRunId: (id: string) => void): Promise<T> {

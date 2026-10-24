@@ -1,4 +1,4 @@
-import { search, getContents, startResearch, getResearch, cancelResearch, runAgent, capture, isConfigured, BASE } from './tf';
+import { search, getContents, startResearch, getResearch, capture, isConfigured } from './tf';
 import type { AgentResult, AgentRunEvent, Decision, Evidence } from './tf';
 
 /* ---------- runtime ---------- */
@@ -66,42 +66,104 @@ async function detectionAgent(ctx: RunCtx, net: Network) {
   return { status: 'ok' as const, data: { lanes, vessels }, evidence: [] as Evidence[], warnings: [] as string[] };
 }
 
-const RELEVANT = /red sea|bab[- ]el[- ]mandeb|suez|houthi|cape of good hope/i;
+const RELEVANT = /red sea|bab[- ]el[- ]mandeb|suez|houthi|cape of good hope|cape town|durban/i;
 const clean = (s: string) => s.replace(/[#*_`>\[\]]/g, '').replace(/\s+/g, ' ').trim().slice(0, 280);
 const host = (u: string) => { try { return new URL(u).hostname; } catch { return ''; } };
 
 function intelligenceAgent(ctx: RunCtx) {
   const A = AGENTS[1];
-  return stage<{ sources: number }>(ctx, 24_000, async (signal) => {
+  return stage<{ sources: number }>(ctx, 28_000, async (signal) => {
     if (!isConfigured()) throw new Error('tinyfish not configured');   // stay fully local until a key is set
     ctx.emit(A, `${A} started`);
     ctx.emit(A, 'TinySearch: gathering Red Sea transit advisories', 'info', 'tinyfish');
-    const hits = (await Promise.all([search('Red Sea Bab-el-Mandeb shipping advisory', signal), search('Suez Canal diversion Cape of Good Hope shipping', signal)])).flat();
-    const seen = new Set<string>();
-    const urls = hits.filter(h => { const d = host(h.url); if (!d || seen.has(d)) return false; seen.add(d); return true; }).slice(0, 4).map(h => h.url);
-    if (!urls.length) throw new Error('no search hits');
-    ctx.emit(A, 'TinyFetch: reading advisory sources', 'info', 'tinyfish');
-    const out = await getContents(urls, signal);
+    const [newsHits, advisoryHits, capeHits, whoHits] = await Promise.all([
+      search('Red Sea shipping attack Bab-el-Mandeb', signal, { news: true }),
+      search('Suez Canal diversion Cape of Good Hope shipping', signal),
+      search('Cape Town Durban port congestion shipping delay', signal),
+      search('WHO vaccine cold chain storage temperature guidance', signal, {
+        purpose: 'Find official WHO vaccine cold chain storage and 2-8 C temperature guidance',
+        recencyMinutes: null,
+      }),
+    ]);
+    const hits = [...newsHits, ...advisoryHits, ...capeHits];
+    const whoOfficial = whoHits.filter(h => host(h.url).endsWith('who.int'));
     const retrievedAt = new Date().toISOString();
-    const evidence: Evidence[] = out.results
-      .filter(p => RELEVANT.test((p.title ?? '') + (p.description ?? '') + (p.text ?? '').slice(0, 3000)))
-      .map((p, i) => ({ id: `fetch-${i}-${ctx.runId.slice(0, 4)}`, provider: 'fetch' as const, title: p.title ?? p.final_url, sourceUrl: p.final_url, retrievedAt, publishedAt: p.published_date ?? undefined, summary: clean(p.description ?? p.text ?? ''), confidence: 0.7 }));
+    ctx.emit(A, newsHits.length
+      ? `Live signal: confirmed — ${newsHits.length} news hit${newsHits.length === 1 ? '' : 's'} in the last 24h`
+      : 'Live signal: no news hit in the last 24h — widening to 7 days', 'info', 'tinyfish');
 
-    // Hard-page backup: a browsing agent for one blocked page.
-    const hard = out.errors.find(e => /bot_blocked|empty_content/.test(e.error));
-    if (hard && evidence.length < 2) {
-      try {
-        ctx.emit(A, 'TinyFish Agent: opening a protected advisory page', 'info', 'tinyfish');
-        let id = '';
-        const r: any = await runAgent(hard.url, 'Return the advisory title, date and a 2-sentence summary',
-          { type: 'object', properties: { title: { type: 'string' }, date: { type: 'string' }, summary: { type: 'string' } } },
-          signal, m => ctx.emit(A, m, 'info', 'tinyfish'), rid => { id = rid; ctx.onCleanup(() => { fetch(`${BASE}/agent/cancel/${id}`, { method: 'POST' }).catch(() => {}); }); });
-        if (r?.summary) evidence.push({ id: 'agent-' + ctx.runId.slice(0, 4), provider: 'agent', title: r.title ?? hard.url, sourceUrl: hard.url, retrievedAt: new Date().toISOString(), publishedAt: r.date, summary: clean(r.summary), confidence: 0.6 });
-      } catch { /* backup only */ }
+    // Web text is untrusted data, never instructions: drop sources that do not
+    // mention the affected corridor or the cold-chain context.
+    const relevant = hits.filter(h => RELEVANT.test(`${h.title} ${h.snippet}`));
+    const seen = new Set<string>();
+    const unique = (relevant.length >= 2 ? relevant : hits).filter(h => {
+      const d = host(h.url);
+      if (!d || seen.has(d)) return false;
+      seen.add(d);
+      return true;
+    });
+    if (!unique.length) throw new Error('no search hits');
+
+    const evidence: Evidence[] = unique.slice(0, 6).map((h, i) => ({
+      id: `search-${i}-${ctx.runId.slice(0, 4)}`,
+      provider: 'search' as const,
+      title: h.title || h.url,
+      sourceUrl: h.url,
+      retrievedAt,
+      publishedAt: h.date,
+      summary: clean(h.snippet || h.title || ''),
+      confidence: 0.68,
+    }));
+
+    // WHO grounding runs through the same Fetch call (no extra request budget).
+    const urls = [...unique.slice(0, 2).map(h => h.url), ...whoOfficial.slice(0, 1).map(h => h.url)];
+    if (capeHits.length) {
+      ctx.emit(A, `Cape route constraints: ${capeHits.length} port advisories retrieved`, 'info', 'tinyfish');
     }
+    try {
+      ctx.emit(A, 'TinyFetch: reading advisory sources', 'info', 'tinyfish');
+      const out = await getContents(urls, signal);
+      for (const p of out.results) {
+        const text = (p.title ?? '') + (p.description ?? '') + (p.text ?? '').slice(0, 3000);
+        if (!RELEVANT.test(text) && !p.text) continue;
+        const i = evidence.findIndex(e => host(e.sourceUrl) === host(p.final_url || p.url));
+        const next: Evidence = {
+          id: (i >= 0 ? evidence[i].id : `fetch-${evidence.length}-${ctx.runId.slice(0, 4)}`),
+          provider: 'fetch',
+          title: p.title ?? p.final_url,
+          sourceUrl: p.final_url || p.url,
+          retrievedAt,
+          publishedAt: p.published_date ?? undefined,
+          summary: clean(p.description ?? p.text ?? ''),
+          confidence: 0.78,
+        };
+        if (i >= 0) evidence[i] = next;
+        else evidence.push(next);
+      }
+    } catch { /* search hits are already live TinyFish evidence */ }
+
+    // Ground the cold-chain score in the WHO 2–8 °C rule when we can find it.
+    if (evidence.some(e => host(e.sourceUrl).endsWith('who.int'))) {
+      ctx.emit(A, 'WHO 2–8 °C storage rule grounded', 'info', 'tinyfish');
+    } else if (whoOfficial[0]) {
+      evidence.push({
+        id: `who-${ctx.runId.slice(0, 4)}`,
+        provider: 'search',
+        title: whoOfficial[0].title || 'WHO vaccine storage guidance',
+        sourceUrl: whoOfficial[0].url,
+        retrievedAt,
+        publishedAt: whoOfficial[0].date,
+        summary: clean(whoOfficial[0].snippet || ''),
+        confidence: 0.74,
+      });
+      ctx.emit(A, 'WHO 2–8 °C storage rule grounded (search excerpt)', 'info', 'tinyfish');
+    } else {
+      ctx.emit(A, 'WHO storage guidance not retrieved — cold-chain score stays modelled', 'warn');
+    }
+
     if (!evidence.length) throw new Error('no relevant evidence');
     ctx.emit(A, `${evidence.length} advisory sources verified`, 'info', 'tinyfish');
-    return { status: 'ok' as const, data: { sources: evidence.length }, evidence, warnings: out.errors.map(e => `${e.url}: ${e.error}`) };
+    return { status: 'ok' as const, data: { sources: evidence.length }, evidence, warnings: [] as string[] };
   }, () => {
     ctx.emit(A, 'TinyFish unavailable — using local resilience model', 'warn');
     ctx.emit(A, 'Assessment completed with limited external evidence', 'warn');
@@ -109,20 +171,55 @@ function intelligenceAgent(ctx: RunCtx) {
   });
 }
 
-async function watchResearch(ctx: RunCtx, onEvidence: (e: Evidence) => void) {
-  if (!isConfigured()) return;                                     // no key → no background research call
+const RESEARCH_QUERY = 'Impact of Red Sea closure on pharmaceutical cold-chain shipping and Cape of Good Hope diversion';
+const RESEARCH_TTL_MS = 12 * 60 * 60 * 1000;   // reuse a briefing for a working day
+const RESEARCH_KEY = 'synapse.research.v1';
+type ResearchCache = { id: string; status: 'running' | 'done'; startedAt: string; evidence?: Evidence };
+
+function readResearch(): ResearchCache | null {
   try {
-    const { research_run_id: id } = await startResearch('Impact of Red Sea closure on pharmaceutical cold-chain shipping and Cape of Good Hope diversion');
-    ctx.onCleanup(() => { cancelResearch(id); });
+    const raw = localStorage.getItem(RESEARCH_KEY);
+    const cached = raw ? (JSON.parse(raw) as ResearchCache) : null;
+    if (!cached?.id) return null;
+    if (Date.now() - Date.parse(cached.startedAt) > RESEARCH_TTL_MS) return null;
+    return cached;
+  } catch { return null; }
+}
+function writeResearch(cache: ResearchCache | null) {
+  try {
+    if (cache) localStorage.setItem(RESEARCH_KEY, JSON.stringify(cache));
+    else localStorage.removeItem(RESEARCH_KEY);
+  } catch { /* storage unavailable */ }
+}
+
+async function watchResearch(ctx: RunCtx, onEvidence: (e: Evidence) => void) {
+  if (!isConfigured()) return;                        // no key → no background research call
+  const cached = readResearch();
+  if (cached?.status === 'done' && cached.evidence) { onEvidence(cached.evidence); return; }   // quota-safe reuse
+
+  let id = cached?.status === 'running' ? cached.id : '';
+  if (!id) {
+    try {
+      const started = await startResearch(RESEARCH_QUERY);
+      id = started?.research_run_id ?? '';
+      if (!id) return;
+      writeResearch({ id, status: 'running', startedAt: new Date().toISOString() });
+    } catch { return; }                                // bonus evidence only
+  }
+
+  // The run is shared by every simulation, so a reset must not cancel it.
+  try {
     for (;;) {
       await new Promise(r => setTimeout(r, 12_000));
       if (ctx.signal.aborted) return;
       const r = await getResearch(id, ctx.signal);
       if (r.status === 'COMPLETED' && r.deep_result?.result) {
-        onEvidence({ id: 'research-' + id, provider: 'research', title: 'TinyFish Research briefing', sourceUrl: r.deep_result.citations?.[0] ?? 'https://agent.tinyfish.ai', retrievedAt: new Date().toISOString(), summary: clean(r.deep_result.result), confidence: 0.8 });
+        const evidence: Evidence = { id: 'research-' + id, provider: 'research', title: 'TinyFish Research briefing', sourceUrl: r.deep_result.citations?.[0] ?? 'https://agent.tinyfish.ai', retrievedAt: new Date().toISOString(), summary: clean(r.deep_result.result), confidence: 0.8 };
+        writeResearch({ id, status: 'done', startedAt: new Date().toISOString(), evidence });
+        onEvidence(evidence);
         return;
       }
-      if (['FAILED', 'CANCELLED', 'TIMED_OUT'].includes(r.status)) return;
+      if (['FAILED', 'CANCELLED', 'TIMED_OUT'].includes(r.status)) { writeResearch(null); return; }
     }
   } catch { /* bonus evidence only */ }
 }

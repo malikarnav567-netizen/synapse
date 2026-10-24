@@ -1,0 +1,7 @@
+{
+  "name": "synapse",
+  "private": true,
+  "scripts": {
+    "build": "npm --prefix red-sea-resilience run build"
+  }
+}
