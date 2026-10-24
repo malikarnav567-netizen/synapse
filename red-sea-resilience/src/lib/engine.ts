@@ -1,4 +1,4 @@
-import { search, getContents, startResearch, getResearch, cancelResearch, runAgent, capture, BASE } from './tf';
+import { search, getContents, startResearch, getResearch, cancelResearch, runAgent, capture, isConfigured, BASE } from './tf';
 import type { AgentResult, AgentRunEvent, Decision, Evidence } from './tf';
 
 /* ---------- runtime ---------- */
@@ -73,6 +73,7 @@ const host = (u: string) => { try { return new URL(u).hostname; } catch { return
 function intelligenceAgent(ctx: RunCtx) {
   const A = AGENTS[1];
   return stage<{ sources: number }>(ctx, 24_000, async (signal) => {
+    if (!isConfigured()) throw new Error('tinyfish not configured');   // stay fully local until a key is set
     ctx.emit(A, `${A} started`);
     ctx.emit(A, 'TinySearch: gathering Red Sea transit advisories', 'info', 'tinyfish');
     const hits = (await Promise.all([search('Red Sea Bab-el-Mandeb shipping advisory', signal), search('Suez Canal diversion Cape of Good Hope shipping', signal)])).flat();
@@ -109,6 +110,7 @@ function intelligenceAgent(ctx: RunCtx) {
 }
 
 async function watchResearch(ctx: RunCtx, onEvidence: (e: Evidence) => void) {
+  if (!isConfigured()) return;                                     // no key → no background research call
   try {
     const { research_run_id: id } = await startResearch('Impact of Red Sea closure on pharmaceutical cold-chain shipping and Cape of Good Hope diversion');
     ctx.onCleanup(() => { cancelResearch(id); });

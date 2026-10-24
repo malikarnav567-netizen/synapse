@@ -14,6 +14,7 @@ const listeners = new Set<() => void>();
 const record = (o: Outcome) => { outcomes.push(o); if (outcomes.length > 20) outcomes.shift(); listeners.forEach(f => f()); };
 export const onStatusChange = (f: () => void) => { listeners.add(f); return () => { listeners.delete(f); }; };
 export const setConfigured = (v: boolean) => { configured = v; listeners.forEach(f => f()); };
+export const isConfigured = () => configured;
 export function deriveStatus(): TinyFishStatus {
   if (!configured) return 'NOT_CONFIGURED';
   const recent = outcomes.slice(-10);

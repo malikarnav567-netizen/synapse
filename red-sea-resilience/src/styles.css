@@ -23,6 +23,12 @@ body{margin:0;background:#000;color:#fff;font-family:Geist,ui-sans-serif,system-
 .in .card{opacity:1;transform:none}
 .in .card:nth-child(n){transition-delay:calc(var(--i,0)*60ms)}
 .rim{position:absolute;inset:0;border-radius:inherit;box-shadow:inset 0 1px 0 rgba(255,255,255,.2),inset 0 0 0 1px rgba(255,255,255,.06);pointer-events:none;z-index:9}
+.mapcard{grid-column:span 12;height:420px;background:radial-gradient(circle at 50% 45%,#0d1424,#04060b 72%)}
+.map{position:absolute;inset:0}
+.mapnote{position:absolute;left:18px;bottom:14px;z-index:5;font-size:11px;color:var(--t2);background:rgba(0,0,0,.55);padding:4px 9px;border-radius:9px}
+.mapnote:empty{display:none}
+.mapcanvas{position:absolute;inset:0}
+@media (max-width:767px){.mapcard{height:320px}}
 .g{position:absolute;inset:0}.core{position:absolute;left:10%;right:10%;top:16%;bottom:-6%;border-radius:90px;filter:blur(60px)}
 .glass{background:rgba(255,255,255,.06);border:1px solid rgba(255,255,255,.12)}.glass .rim{display:none}
 .in-c{position:absolute;inset:0;padding:22px 24px;z-index:2}

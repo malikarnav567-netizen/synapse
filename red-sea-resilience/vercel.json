@@ -1,22 +1,12 @@
 {
-  "builds": [
-    {
-      "src": "dist/index.html",
-      "use": "@vercel/redirect"
-    },
-    {
-      "src": "server/index.ts",
-      "use": "@vercel/node"
+  "$schema": "https://openapi.vercel.sh/vercel.json",
+  "framework": null,
+  "buildCommand": "npm run build",
+  "outputDirectory": "dist",
+  "functions": {
+    "api/[...path].ts": {
+      "memory": 1024,
+      "maxDuration": 60
     }
-  ],
-  "routes": [
-    {
-      "src": "/api/(.*)",
-      "dest": "server/index.ts"
-    },
-    {
-      "src": "/(.*)",
-      "dest": "dist/index.html"
-    }
-  ]
+  }
 }

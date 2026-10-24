@@ -2,7 +2,6 @@ import 'dotenv/config';
 import express from 'express';
 import path from 'node:path';
 import { Readable } from 'node:stream';
-import { chromium } from 'playwright-core';
 
 const app = express();
 app.use(express.json({ limit: '1mb' }));
@@ -73,6 +72,7 @@ app.post('/api/tf/browser/capture', async (req, res) => {
       signal: AbortSignal.timeout(60_000),
     }).then(r => r.json());
     sessionId = s.session_id;
+    const { chromium } = await import('playwright-core');   // lazy: keeps the serverless bundle small
     const browser = await chromium.connectOverCDP(s.cdp_url);
     await new Promise(r => setTimeout(r, 2000));
     const page = browser.contexts()[0].pages()[0];
@@ -89,4 +89,7 @@ app.post('/api/tf/browser/capture', async (req, res) => {
 app.use(express.static('dist'));
 app.get(/^(?!\/api).*/, (_q, r) => r.sendFile(path.resolve('dist/index.html'), e => e && r.status(404).end()));
 
-app.listen(Number(process.env.PORT ?? 8787), () => console.log('kitchen open on :' + (process.env.PORT ?? 8787)));
+const PORT = Number(process.env.PORT) || 8787;
+if (!process.env.VERCEL) app.listen(PORT, () => console.log('kitchen open on :' + PORT));
+
+export default app;
