@@ -18,12 +18,5 @@
       "src": "/(.*)",
       "dest": "dist/index.html"
     }
-  ],
-  "functions": {
-    "server/index.ts": {
-      "nodejs": {
-        "version": "22.x"
-      }
-    }
-  }
+  ]
 }
