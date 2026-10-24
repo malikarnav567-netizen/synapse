@@ -1,0 +1,29 @@
+{
+  "builds": [
+    {
+      "src": "dist/index.html",
+      "use": "@vercel/redirect"
+    },
+    {
+      "src": "server/index.ts",
+      "use": "@vercel/node"
+    }
+  ],
+  "routes": [
+    {
+      "src": "/api/(.*)",
+      "dest": "server/index.ts"
+    },
+    {
+      "src": "/(.*)",
+      "dest": "dist/index.html"
+    }
+  ],
+  "functions": {
+    "server/index.ts": {
+      "nodejs": {
+        "version": "22.x"
+      }
+    }
+  }
+}
