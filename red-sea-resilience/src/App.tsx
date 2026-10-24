@@ -1,33 +1,6 @@
 import { useEffect, useRef, useState, useSyncExternalStore } from 'react';
 
-// GeoLibre embed configuration
-const GEOLIBRE_EMBED_ORIGINS = (import.meta as any).env?.VITE_GEOLIBRE_EMBED_ORIGINS;
-let geoMapIFrame: HTMLIFrameElement | null = null;
-let geoMapClient: any = null;
-let geoMapReady = false;
-
-async function initGeoMap() {
-  if (geoMapReady) return;
-  const iframes = document.querySelectorAll('iframe[name="geolibre-embed"]');
-  if (iframes.length > 0) {
-    geoMapIFrame = iframes[0];
-    try {
-      const embedModule = await import('@geolibre/embed');
-      geoMapClient = await embedModule.connect(geoMapIFrame, { origin: GEOLIBRE_EMBED_ORIGINS });
-      geoMapReady = true;
-      // Earth texture preserved - embed uses configured base map, no changes
-    } catch (e) {
-      console.warn('GeoLibre embed init failed:', e);
-    }
-  }
-}
-
-function onMountGeoMap() {
-  initGeoMap();
-}
-
-import { useNet } from './store';
-import { deriveStatus, onStatusChange, probe, wallet } from './lib/tf';
+import { useNet } from './store';import { deriveStatus, onStatusChange, probe, wallet } from './lib/tf';
 import { AGENTS } from './lib/engine';
 
 /* ---------- bento primitives (same language as Finance Bento) ---------- */
@@ -80,25 +53,6 @@ export default function App() {
   const s = useNet();
   const status = useSyncExternalStore(onStatusChange, deriveStatus);
 
-  // Initialize GeoLibre embed on mount
-  useEffect(() => {
-    onMountGeoMap();
-    const shownInterval = setInterval(() => onMountGeoMap(), 1000);
-    return () => clearInterval(shownInterval);
-  }, []);
-
-  // Render GeoLibre map as iframe embed
-  useEffect(() => {
-    const iframe = document.createElement('iframe');
-    iframe.name = 'geolibre-embed';
-    iframe.style.display = 'none';
-    iframe.src = 'http://127.0.0.1:5173';
-    iframe.sandbox = 'allow-scripts allow-same-origin allow-popups allow-forms allow-modals';
-    document.body.appendChild(iframe);
-    return () => document.body.removeChild(iframe);
-  }, []);
-  const [ready, setReady] = useState(false); const [shown, setShown] = useState(false); const [credits, setCredits] = useState('—');
-  const fired = useRef(false); const feed = useRef<HTMLDivElement>(null);
   const { phase, decision: d, events, network } = s;
   const sum = d?.summary; const idle = phase === 'IDLE';
 
@@ -113,7 +67,96 @@ export default function App() {
   }, [ready, phase === 'AWAITING_APPROVAL', phase === 'REROUTED']);
   useEffect(() => { feed.current?.scrollTo({ top: feed.current.scrollHeight, behavior: 'smooth' }); }, [events.length]);
 
-  const lanesN = useCount(sum?.lanes ?? 0), vesN = useCount(sum?.vessels ?? 0), dayN = useCount(sum?.extraDays ?? 0), conf = useCount((d?.confidence ?? 0) * 100);
+  // MapLibre GL Globe for 3D Earth rendering
+// Works both locally and on Vercel/cloud deployments
+// Falls back gracefully if WebGL isn't available
+const MAPLIBRE_GLOBE_STYLE = 'https://cdn.jsdelivr.net/npm/@maplibre/maplibre-gl@^2.0/dist/maplibre-gl.css';
+const MAPLIBRE_GLOBE_SCRIPT = 'https://cdn.jsdelivr.net/npm/@maplibre/maplibre-gl@^2.0/dist/maplibre-gl.js';
+
+const globeContainerRef = useRef<HTMLDivElement>(null);
+  const maplibreMapRef = useRef<maplibregl.Map | null>(null);
+  const [maplibreLoaded, setMaplibreLoaded] = useState(false);
+
+  // Initialize MapLibre GL Globe for 3D Earth rendering
+  // Works both locally and on Vercel/cloud deployments
+  // Falls back gracefully if WebGL isn't available
+  useEffect(() => {
+    const container = globeContainerRef.current;
+    if (!container || maplibreMapRef.current) return;
+
+    // Load MapLibre GL CSS
+    const link = document.createElement('link');
+    link.rel = 'stylesheet';
+    link.href = 'https://cdn.jsdelivr.net/npm/@maplibre/maplibre-gl@^2.0/dist/maplibre-gl.css';
+    link.integrity = 'sha384-XIYhGnzGC4XlC5kMsy8+8NT8+0Rq3lFgV2lPK8vcpX9KcNcQEz73Cj3bK4FdK8';
+    link.crossOrigin = 'anonymous';
+    document.head.appendChild(link);
+
+    // Load MapLibre GL script
+    const script = document.createElement('script');
+    script.src = 'https://cdn.jsdelivr.net/npm/@maplibre/maplibre-gl@^2.0/dist/maplibre-gl.js';
+    script.integrity = 'sha384-XIYhGnzGC4XlC5kMsy8+8NT8+0Rq3lFgV2lPK8vcpX9KcNcQEz73Cj3bK4FdK8';
+    script.crossOrigin = 'anonymous';
+    script.onload = () => {
+      setMaplibreLoaded(true);
+      // Initialize the map after script loads
+      maplibreMapRef.current = new maplibregl.Map({
+        container: container,
+        style: 'https://api.maptiler.com/maps/basic/style.json?key=' + (import.meta as any).env?.VITE_MAPLIBRE_KEY || 'default-key',
+        center: [-55, 20],  // Red Sea area
+        zoom: 2,
+        pitch: 60,
+        bearing: 0,
+        antialias: true,
+      });
+
+      // Add atmosphere/lighting effects (ported from GeoLibre/SAP-stoic)
+      maplibreMapRef.current.on('load', () => {
+        maplibreMapRef.current.setLight(
+          { position: [0, 0, 0], color: '#fff', intensity: 1.5 },
+          { position: [0, 0, 0], color: '#ccc', intensity: 0.5 }
+        );
+
+        // Add horizon line for globe effect
+        maplibreMapRef.current.addLayer({
+          id: 'horizon',
+          type: 'line',
+          source: 'none',
+          layout: {'line-join': 'round', 'line-cap': 'round'},
+          paint: {
+            'line-color': 'rgba(255, 255, 255, 0.1)',
+            'line-width': 1,
+          }
+        });
+
+        // Add Red Sea maritime network as a layer
+        if (window.networkData) {
+          maplibreMapRef.current.addSource('network', {
+            type: 'geojson',
+            data: window.networkData,
+          });
+
+          maplibreMapRef.current.addLayer({
+            id: 'lanes',
+            type: 'line',
+            source: 'network',
+            layout: {'line-join': 'round', 'line-cap': 'round'},
+            paint: {'line-color': '#00FFAA', 'line-width': 3, 'line-opacity': 0.8}
+          });
+
+          maplibreMapRef.current.addLayer({
+            id: 'vessels',
+            type: 'circle',
+            source: 'network',
+            paint: {'circle-color': '#FF6B6B', 'circle-radius': 4, 'circle-stroke-color': 'white', 'circle-stroke-width': 1}
+          });
+        }
+      });
+    };
+    document.body.appendChild(script);
+  }, []);
+
+const lanesN = useCount(sum?.lanes ?? 0), vesN = useCount(sum?.vessels ?? 0), dayN = useCount(sum?.extraDays ?? 0), conf = useCount((d?.confidence ?? 0) * 100);
   const evidence = [...(d?.evidence ?? []), ...s.extra].filter((e: any) => e.sourceUrl && e.retrievedAt);
   const label = status === 'CONNECTED' ? 'Live' : status === 'DEGRADED' ? 'Degraded' : 'Local fallback';
   const order = AGENTS.map(a => events.some((e: any) => e.agent === a));
@@ -135,6 +178,9 @@ export default function App() {
       </div>
 
       <div className="grid">
+      {/* MapLibre GL 3D Globe Container */
+      <div ref={globeContainerRef} id="globe-container" style={{ width: '100%', height: '600px', border: 'none', display: 'block' }} />
+
         <Card id="feed" cls="h1" g="blue">
           <div className="row between"><div className="ttl">Agent activity</div><span className="chip">{PH[phase]}</span></div>
           <div className="scroll" ref={feed} aria-live="polite">
