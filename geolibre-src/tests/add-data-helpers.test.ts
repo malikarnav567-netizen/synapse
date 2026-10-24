@@ -1,0 +1,815 @@
+import assert from "node:assert/strict";
+import { beforeEach, describe, it } from "node:test";
+import {
+  DEFAULT_LAYER_STYLE,
+  darkenHex,
+  type GeoLibreLayer,
+  LAYER_PALETTE,
+  useAppStore,
+  VECTOR_COLOR_RAMPS,
+} from "@geolibre/core";
+import type { FeatureCollection } from "geojson";
+import {
+  EOX_S2CLOUDLESS_ATTRIBUTION,
+  GEBCO_ATTRIBUTION,
+  ZARR_GLOBE_SAMPLES,
+} from "../apps/geolibre-desktop/src/components/layout/add-data/constants";
+import {
+  appendQuery,
+  attributionForTileUrl,
+  createBaseLayer,
+  createWfsGetCapabilitiesUrl,
+  createWmsGetCapabilitiesUrl,
+  createWmsTileUrl,
+  fileNameFromPath,
+  normalizeWmsCrs,
+  normalizeWmsVersion,
+  stripOgcOperationParams,
+  wmsVersionFromEndpoint,
+  geoJsonToPointRows,
+  isServiceFormUrl,
+  layerNameFromPath,
+  normalizeCrs,
+  parseOptionalNumber,
+  parseRequiredNumber,
+  parseVideoCorner,
+  readLimitedBody,
+  resolveDelimitedTextDelimiter,
+  savedPostgresConnectionLabel,
+  serviceRequestErrorMessage,
+} from "../apps/geolibre-desktop/src/components/layout/add-data/helpers";
+import type { TFunction } from "i18next";
+
+// A minimal `t` stub: returns the key so the branch taken is observable, and
+// echoes the fallback for the default branch.
+const fakeT = ((key: string) => key) as unknown as TFunction;
+
+describe("add-data path helpers", () => {
+  it("extracts the file name from POSIX and Windows paths", () => {
+    assert.equal(fileNameFromPath("/data/sub/route.gpx"), "route.gpx");
+    assert.equal(fileNameFromPath("C:\\data\\route.gpx"), "route.gpx");
+    assert.equal(fileNameFromPath("route.gpx"), "route.gpx");
+  });
+
+  it("derives a layer name by stripping the extension, with a fallback", () => {
+    assert.equal(layerNameFromPath("/data/us_cities.csv", "Layer"), "us_cities");
+    assert.equal(layerNameFromPath("/data/.hidden", "Layer"), "Layer");
+  });
+});
+
+describe("appendQuery", () => {
+  it("appends params with the right separator and encodes values", () => {
+    assert.equal(
+      appendQuery("https://x.test/wms", [["LAYERS", "a:b c"]]),
+      "https://x.test/wms?LAYERS=a%3Ab%20c",
+    );
+    assert.equal(
+      appendQuery("https://x.test/wms?foo=1", [["BAR", "2"]]),
+      "https://x.test/wms?foo=1&BAR=2",
+    );
+    assert.equal(appendQuery("https://x.test/wms?", [["BAR", "2"]]), "https://x.test/wms?BAR=2");
+  });
+
+  it("leaves the bbox placeholder unescaped", () => {
+    assert.equal(
+      appendQuery("https://x.test/wms", [["BBOX", "{bbox-epsg-3857}"]]),
+      "https://x.test/wms?BBOX={bbox-epsg-3857}",
+    );
+  });
+});
+
+describe("createWmsTileUrl", () => {
+  it("builds a GetMap request with the standard parameters", () => {
+    const url = createWmsTileUrl({
+      endpoint: "https://x.test/wms",
+      layers: "topp:states",
+      styles: "",
+      format: "image/png",
+      transparent: true,
+      tileSize: 256,
+    });
+    assert.ok(url.startsWith("https://x.test/wms?SERVICE=WMS&REQUEST=GetMap"));
+    assert.ok(url.includes("LAYERS=topp%3Astates"));
+    assert.ok(url.includes("TRANSPARENT=TRUE"));
+    assert.ok(url.includes("BBOX={bbox-epsg-3857}"));
+    assert.ok(url.includes("WIDTH=256"));
+  });
+
+  it("marks the request opaque when transparency is off", () => {
+    const url = createWmsTileUrl({
+      endpoint: "https://x.test/wms",
+      layers: "a",
+      styles: "",
+      format: "image/jpeg",
+      transparent: false,
+      tileSize: 512,
+    });
+    assert.ok(url.includes("TRANSPARENT=FALSE"));
+    assert.ok(url.includes("HEIGHT=512"));
+  });
+
+  it("defaults to WMS 1.1.1 with an SRS parameter", () => {
+    const url = createWmsTileUrl({
+      endpoint: "https://x.test/wms",
+      layers: "a",
+      styles: "",
+      format: "image/png",
+      transparent: true,
+      tileSize: 256,
+    });
+    assert.ok(url.includes("VERSION=1.1.1"));
+    assert.ok(url.includes("SRS=EPSG%3A3857"));
+    assert.ok(!url.includes("CRS="));
+  });
+
+  it("switches to CRS for a WMS 1.3.0 request", () => {
+    // A 1.3.0-only server (e.g. the IGN Géoplateforme raster endpoint) rejects
+    // a 1.1.1 GetMap with VersionNegotiationFailed, so the version must be
+    // honored and the SRS parameter renamed to CRS.
+    const url = createWmsTileUrl({
+      endpoint: "https://x.test/wms",
+      layers: "a",
+      styles: "",
+      format: "image/png",
+      transparent: true,
+      tileSize: 256,
+      version: "1.3.0",
+    });
+    assert.ok(url.includes("VERSION=1.3.0"));
+    assert.ok(url.includes("CRS=EPSG%3A3857"));
+    assert.ok(!url.includes("SRS="));
+    assert.ok(url.includes("BBOX={bbox-epsg-3857}"));
+  });
+});
+
+describe("createWmsTileUrl with a crs", () => {
+  const base = {
+    endpoint: "https://x.test/wms",
+    layers: "a",
+    styles: "",
+    format: "image/png",
+    transparent: true,
+    tileSize: 256,
+  };
+
+  it("writes a geographic CRS as SRS for WMS 1.1.1", () => {
+    const url = createWmsTileUrl({ ...base, crs: "EPSG:4326" });
+    assert.ok(url.includes("SRS=EPSG%3A4326"));
+    assert.ok(!url.includes("EPSG%3A3857"));
+    // The BBOX stays the Web Mercator template: the desktop tile protocol
+    // rewrites it for the requested CRS.
+    assert.ok(url.includes("BBOX={bbox-epsg-3857}"));
+  });
+
+  it("writes the CRS parameter for WMS 1.3.0", () => {
+    const url = createWmsTileUrl({ ...base, version: "1.3.0", crs: "EPSG:4326" });
+    assert.ok(url.includes("CRS=EPSG%3A4326"));
+    assert.ok(!url.includes("SRS="));
+  });
+
+  it("writes CRS:84 and a projected EPSG code", () => {
+    assert.ok(
+      createWmsTileUrl({ ...base, version: "1.3.0", crs: "CRS:84" }).includes("CRS=CRS%3A84"),
+    );
+    assert.ok(createWmsTileUrl({ ...base, crs: "EPSG:25833" }).includes("SRS=EPSG%3A25833"));
+  });
+});
+
+describe("normalizeWmsCrs", () => {
+  it("defaults to Web Mercator", () => {
+    assert.equal(normalizeWmsCrs(undefined, "1.1.1"), "EPSG:3857");
+    assert.equal(normalizeWmsCrs(null, "1.3.0"), "EPSG:3857");
+  });
+
+  it("trims and upper-cases the geographic and EPSG codes it accepts", () => {
+    assert.equal(normalizeWmsCrs(" epsg:4326 ", "1.1.1"), "EPSG:4326");
+    assert.equal(normalizeWmsCrs("EPSG:6706", "1.3.0"), "EPSG:6706");
+    assert.equal(normalizeWmsCrs("crs:84", "1.3.0"), "CRS:84");
+    assert.equal(normalizeWmsCrs("EPSG:25832", "1.1.1"), "EPSG:25832");
+  });
+
+  it("rejects CRS:84 with WMS 1.1.1", () => {
+    assert.throws(() => normalizeWmsCrs("CRS:84", "1.1.1"), /needs version "1.3.0"/);
+    assert.throws(() => normalizeWmsCrs("CRS:84", undefined), /needs version "1.3.0"/);
+  });
+
+  it("reads the version the way normalizeWmsVersion does", () => {
+    assert.equal(normalizeWmsCrs("CRS:84", "1.3"), "CRS:84");
+  });
+
+  it("rejects values that are not an EPSG code", () => {
+    for (const value of ["", "EPSG:", "EPSG:12", "WGS84", "urn:ogc:def:crs:EPSG::4326", 4326]) {
+      assert.throws(() => normalizeWmsCrs(value, "1.3.0"), /Unsupported WMS CRS/);
+    }
+  });
+});
+
+describe("normalizeWmsVersion", () => {
+  it("collapses versions to the 1.1.1/1.3.0 pair", () => {
+    assert.equal(normalizeWmsVersion(undefined), "1.1.1");
+    assert.equal(normalizeWmsVersion(null), "1.1.1");
+    assert.equal(normalizeWmsVersion("1.1.1"), "1.1.1");
+    assert.equal(normalizeWmsVersion("1.3.0"), "1.3.0");
+    assert.equal(normalizeWmsVersion("1.3"), "1.3.0");
+    assert.equal(normalizeWmsVersion("garbage"), "1.1.1");
+    // An untyped JS plugin can pass a non-string; it must not throw.
+    assert.equal(normalizeWmsVersion(1.3), "1.1.1");
+    assert.equal(normalizeWmsVersion({}), "1.1.1");
+  });
+});
+
+describe("wmsVersionFromEndpoint", () => {
+  it("reads the VERSION parameter from a pasted service URL", () => {
+    assert.equal(wmsVersionFromEndpoint("https://data.geopf.fr/wms-r?VERSION=1.3.0"), "1.3.0");
+    assert.equal(wmsVersionFromEndpoint("https://x.test/wms?version=1.1.1&foo=1"), "1.1.1");
+    assert.equal(wmsVersionFromEndpoint("https://x.test/wms?VERSION=1.0.0"), "1.1.1");
+    // Any 1.x value is bucketed the same way normalizeWmsVersion buckets it.
+    assert.equal(wmsVersionFromEndpoint("https://x.test/wms?VERSION=1.2.0"), "1.1.1");
+  });
+
+  it("returns null when no usable version is present", () => {
+    assert.equal(wmsVersionFromEndpoint("https://x.test/wms"), null);
+    assert.equal(wmsVersionFromEndpoint("https://x.test/wms?VERSION=abc"), null);
+    // An undecodable value must not throw.
+    assert.equal(wmsVersionFromEndpoint("https://x.test/wms?VERSION=%E0%A4%A"), null);
+  });
+});
+
+describe("createWmsGetCapabilitiesUrl", () => {
+  it("appends SERVICE and REQUEST to a bare endpoint", () => {
+    const url = new URL(createWmsGetCapabilitiesUrl("https://x.test/wms"));
+    assert.equal(url.searchParams.get("SERVICE"), "WMS");
+    assert.equal(url.searchParams.get("REQUEST"), "GetCapabilities");
+  });
+
+  it("strips leftover GetMap operation params so they cannot collide", () => {
+    const url = new URL(
+      createWmsGetCapabilitiesUrl(
+        "https://x.test/wms?SERVICE=WMS&REQUEST=GetMap&LAYERS=a&BBOX=0,0,1,1&token=abc",
+      ),
+    );
+    assert.equal(url.searchParams.get("REQUEST"), "GetCapabilities");
+    assert.equal(url.searchParams.get("LAYERS"), null);
+    assert.equal(url.searchParams.get("BBOX"), null);
+    // Non-operation params (e.g. an auth token) are preserved.
+    assert.equal(url.searchParams.get("token"), "abc");
+  });
+
+  it("handles a relative endpoint", () => {
+    assert.equal(
+      createWmsGetCapabilitiesUrl("/geoserver/wms"),
+      "/geoserver/wms?SERVICE=WMS&REQUEST=GetCapabilities",
+    );
+  });
+
+  it("preserves a route-relative endpoint's path form", () => {
+    assert.equal(
+      createWmsGetCapabilitiesUrl("geoserver/wms"),
+      "geoserver/wms?SERVICE=WMS&REQUEST=GetCapabilities",
+    );
+  });
+
+  it("keeps the host of a protocol-relative endpoint", () => {
+    const url = createWmsGetCapabilitiesUrl("//example.com/geoserver/wms");
+    assert.ok(url.startsWith("//example.com/geoserver/wms?"));
+    const params = new URLSearchParams(url.slice(url.indexOf("?")));
+    assert.equal(params.get("SERVICE"), "WMS");
+    assert.equal(params.get("REQUEST"), "GetCapabilities");
+  });
+
+  it("strips stale operation params on a relative endpoint too", () => {
+    const url = createWmsGetCapabilitiesUrl("/geoserver/wms?REQUEST=GetMap&LAYERS=a&token=abc");
+    // Relative form is preserved (no scheme/host injected).
+    assert.ok(url.startsWith("/geoserver/wms?"));
+    const params = new URLSearchParams(url.slice(url.indexOf("?")));
+    assert.equal(params.get("REQUEST"), "GetCapabilities");
+    assert.equal(params.get("LAYERS"), null);
+    assert.equal(params.get("token"), "abc");
+  });
+
+  it("keeps outputFormat, which portals publish on their capabilities URLs", () => {
+    const url = new URL(
+      createWmsGetCapabilitiesUrl(
+        "https://x.test/ows?service=WMS&version=1.3.0&request=GetCapabilities&outputFormat=application/xml",
+      ),
+    );
+    assert.equal(url.searchParams.get("outputFormat"), "application/xml");
+    assert.equal(url.searchParams.get("REQUEST"), "GetCapabilities");
+  });
+});
+
+describe("createWfsGetCapabilitiesUrl", () => {
+  it("appends SERVICE, REQUEST, and the version when given", () => {
+    const url = new URL(createWfsGetCapabilitiesUrl("https://x.test/wfs", "2.0.0"));
+    assert.equal(url.searchParams.get("SERVICE"), "WFS");
+    assert.equal(url.searchParams.get("REQUEST"), "GetCapabilities");
+    assert.equal(url.searchParams.get("VERSION"), "2.0.0");
+  });
+
+  it("strips leftover GetFeature operation params", () => {
+    const url = new URL(
+      createWfsGetCapabilitiesUrl(
+        "https://x.test/ows?service=WFS&version=1.1.0&request=GetFeature&typeName=a&token=abc",
+      ),
+    );
+    assert.equal(url.searchParams.get("REQUEST"), "GetCapabilities");
+    assert.equal(url.searchParams.get("typeName"), null);
+    assert.equal(url.searchParams.get("token"), "abc");
+  });
+
+  it("omits VERSION when not provided", () => {
+    const url = new URL(createWfsGetCapabilitiesUrl("https://x.test/wfs"));
+    assert.equal(url.searchParams.get("VERSION"), null);
+  });
+});
+
+describe("stripOgcOperationParams", () => {
+  it("removes a pasted GetCapabilities query, leaving the base endpoint", () => {
+    assert.equal(
+      stripOgcOperationParams(
+        "https://wms.ign.gob.ar/geoserver/ows?service=wfs&version=1.1.0&request=GetCapabilities",
+        "WFS",
+      ),
+      "https://wms.ign.gob.ar/geoserver/ows",
+    );
+  });
+
+  it("keeps non-operation params like an auth token", () => {
+    assert.equal(
+      stripOgcOperationParams("https://x.test/wms?REQUEST=GetMap&LAYERS=a&token=abc", "WMS"),
+      "https://x.test/wms?token=abc",
+    );
+  });
+
+  it("drops outputFormat from a WMS endpoint, case-insensitively", () => {
+    assert.equal(
+      stripOgcOperationParams(
+        "https://x.test/ows?service=WMS&version=1.3.0&request=GetCapabilities&outputFormat=application/xml&token=abc",
+        "WMS",
+      ),
+      "https://x.test/ows?token=abc",
+    );
+    assert.equal(
+      stripOgcOperationParams("https://x.test/ows?OUTPUTFORMAT=text/xml", "WMS"),
+      "https://x.test/ows",
+    );
+  });
+
+  it("leaves an already-clean endpoint untouched", () => {
+    assert.equal(
+      stripOgcOperationParams("https://x.test/geoserver/wms", "WMS"),
+      "https://x.test/geoserver/wms",
+    );
+  });
+});
+
+describe("number parsing helpers", () => {
+  it("parses required numbers and rejects non-numeric input", () => {
+    assert.equal(parseRequiredNumber("42", "value"), 42);
+    assert.throws(() => parseRequiredNumber("abc", "value"), /numeric value/);
+  });
+
+  it("treats blank optional numbers as undefined", () => {
+    assert.equal(parseOptionalNumber("   ", "max features"), undefined);
+    assert.equal(parseOptionalNumber("10", "max features"), 10);
+    assert.throws(() => parseOptionalNumber("x", "max features"));
+  });
+});
+
+describe("parseVideoCorner", () => {
+  it("parses a longitude, latitude pair", () => {
+    assert.deepEqual(parseVideoCorner("-122.5, 37.5", "top-left"), [-122.5, 37.5]);
+  });
+
+  it("rejects malformed or out-of-range corners", () => {
+    assert.throws(() => parseVideoCorner("1", "top-left"), /longitude, latitude/);
+    assert.throws(() => parseVideoCorner("200, 0", "top-left"), /longitude/);
+    assert.throws(() => parseVideoCorner("0, 100", "top-left"), /latitude/);
+  });
+});
+
+describe("resolveDelimitedTextDelimiter", () => {
+  it("maps known delimiters and passes custom ones through", () => {
+    assert.equal(resolveDelimitedTextDelimiter("comma", ""), ",");
+    assert.equal(resolveDelimitedTextDelimiter("tab", ""), "\t");
+    assert.equal(resolveDelimitedTextDelimiter("custom", "~"), "~");
+  });
+});
+
+describe("normalizeCrs", () => {
+  it("qualifies a bare code and upper-cases an authority string", () => {
+    assert.equal(normalizeCrs("32643"), "EPSG:32643");
+    assert.equal(normalizeCrs("epsg:4326"), "EPSG:4326");
+    assert.equal(normalizeCrs("esri:102100"), "ESRI:102100");
+  });
+
+  it("returns blank for an empty or whitespace-only value", () => {
+    assert.equal(normalizeCrs(""), "");
+    assert.equal(normalizeCrs("   "), "");
+  });
+
+  it("strips internal whitespace so a pasted `EPSG: 32643` is valid for PROJ", () => {
+    assert.equal(normalizeCrs("EPSG: 32643"), "EPSG:32643");
+    assert.equal(normalizeCrs("  epsg : 4326 "), "EPSG:4326");
+  });
+
+  it("passes a WKT definition through untouched (apart from edge trimming)", () => {
+    const wkt = '  GEOGCS["WGS 84",DATUM["WGS_1984"]]  ';
+    assert.equal(normalizeCrs(wkt), 'GEOGCS["WGS 84",DATUM["WGS_1984"]]');
+  });
+});
+
+describe("savedPostgresConnectionLabel", () => {
+  it("masks the password in a URL connection string", () => {
+    assert.equal(
+      savedPostgresConnectionLabel("postgres://user:secret@host:5432/db"),
+      "postgres://user:****@host:5432/db",
+    );
+  });
+
+  it("masks the password in a keyword connection string", () => {
+    assert.equal(
+      savedPostgresConnectionLabel("host=localhost password=secret dbname=db"),
+      "host=localhost password=**** dbname=db",
+    );
+  });
+
+  it("masks single-quoted passwords that contain spaces", () => {
+    assert.equal(
+      savedPostgresConnectionLabel("host=a password='my secret' dbname=b"),
+      "host=a password=**** dbname=b",
+    );
+  });
+
+  it("masks every password occurrence, not just the first", () => {
+    assert.equal(
+      savedPostgresConnectionLabel("host=a password=one application_name=x password=two"),
+      "host=a password=**** application_name=x password=****",
+    );
+  });
+});
+
+describe("geoJsonToPointRows", () => {
+  it("flattens point features to lng/lat rows with properties", () => {
+    const fc: FeatureCollection = {
+      type: "FeatureCollection",
+      features: [
+        {
+          type: "Feature",
+          properties: { name: "A", height: 10 },
+          geometry: { type: "Point", coordinates: [-122, 37] },
+        },
+        {
+          type: "Feature",
+          properties: null,
+          geometry: { type: "Point", coordinates: [1, 2] },
+        },
+      ],
+    };
+    assert.deepEqual(geoJsonToPointRows(fc), [
+      { name: "A", height: 10, lng: -122, lat: 37 },
+      { lng: 1, lat: 2 },
+    ]);
+  });
+
+  it("uses the first coordinate of nested geometries and skips empty ones", () => {
+    const fc: FeatureCollection = {
+      type: "FeatureCollection",
+      features: [
+        {
+          type: "Feature",
+          properties: {},
+          geometry: {
+            type: "LineString",
+            coordinates: [
+              [5, 6],
+              [7, 8],
+            ],
+          },
+        },
+        {
+          type: "Feature",
+          properties: {},
+          geometry: { type: "GeometryCollection", geometries: [] } as never,
+        },
+      ],
+    };
+    assert.deepEqual(geoJsonToPointRows(fc), [{ lng: 5, lat: 6 }]);
+  });
+
+  it("returns an empty array when there is no collection", () => {
+    assert.deepEqual(geoJsonToPointRows(undefined), []);
+  });
+
+  it("lets geometry coordinates win over lng/lat properties of the same name", () => {
+    const fc: FeatureCollection = {
+      type: "FeatureCollection",
+      features: [
+        {
+          type: "Feature",
+          // Properties carry their own lng/lat that must NOT shadow the
+          // geometry-derived placement coordinates.
+          properties: { lng: 999, lat: -999, name: "Z" },
+          geometry: { type: "Point", coordinates: [-122, 37] },
+        },
+      ],
+    };
+    assert.deepEqual(geoJsonToPointRows(fc), [{ name: "Z", lng: -122, lat: 37 }]);
+  });
+});
+
+describe("attributionForTileUrl", () => {
+  it("credits EOX Sentinel-2 cloudless tiles, including subdomain variants", () => {
+    assert.equal(
+      attributionForTileUrl(
+        "https://tiles.maps.eox.at/wmts/1.0.0/s2cloudless-2025_3857/default/g/{z}/{y}/{x}.jpg",
+      ),
+      EOX_S2CLOUDLESS_ATTRIBUTION,
+    );
+    assert.equal(
+      attributionForTileUrl(
+        "https://s2maps-tiles.eox.at/wmts/1.0.0/s2cloudless-2025_3857/default/g/{z}/{y}/{x}.jpg",
+      ),
+      EOX_S2CLOUDLESS_ATTRIBUTION,
+    );
+  });
+
+  it("credits GEBCO bathymetry on the WMS host and its subdomains", () => {
+    // The GetMap template built from the sample endpoint carries the host.
+    assert.equal(
+      attributionForTileUrl(
+        "https://wms.gebco.net/mapserv?SERVICE=WMS&REQUEST=GetMap&LAYERS=GEBCO_LATEST&BBOX={bbox-epsg-3857}",
+      ),
+      GEBCO_ATTRIBUTION,
+    );
+    // Bare-domain case also matches the `.gebco.net` suffix rule.
+    assert.equal(
+      attributionForTileUrl("https://gebco.net/mapserv?LAYERS=GEBCO_LATEST"),
+      GEBCO_ATTRIBUTION,
+    );
+  });
+
+  it("returns undefined for other hosts, lookalikes, and malformed URLs", () => {
+    assert.equal(
+      attributionForTileUrl("https://tile.openstreetmap.org/{z}/{x}/{y}.png"),
+      undefined,
+    );
+    // A non-s2cloudless EOX layer has no known CC BY credit to attach.
+    assert.equal(
+      attributionForTileUrl("https://tiles.maps.eox.at/wmts/1.0.0/terrain/{z}/{y}/{x}.jpg"),
+      undefined,
+    );
+    // Lookalike host must not match the `.eox.at` suffix check.
+    assert.equal(
+      attributionForTileUrl("https://evil-eox.at/s2cloudless/{z}/{y}/{x}.jpg"),
+      undefined,
+    );
+    // Lookalike host must not match the `.gebco.net` suffix check.
+    assert.equal(
+      attributionForTileUrl("https://evil-gebco.net/mapserv?LAYERS=GEBCO_LATEST"),
+      undefined,
+    );
+    assert.equal(attributionForTileUrl("not a url"), undefined);
+  });
+});
+
+describe("isServiceFormUrl", () => {
+  it("accepts absolute HTTP(S) service URLs", () => {
+    assert.equal(isServiceFormUrl("https://geoserver.example.org/geoserver/wms"), true);
+    assert.equal(isServiceFormUrl("http://127.0.0.1:8080/wfs"), true);
+    assert.equal(isServiceFormUrl("  https://x.test/wms  "), true);
+  });
+
+  it("accepts same-origin references for reverse-proxied deployments", () => {
+    assert.equal(isServiceFormUrl("/geoserver/wms"), true);
+    assert.equal(isServiceFormUrl("geoserver/wfs"), true);
+  });
+
+  it("refuses non-HTTP schemes, protocol-relative URLs, and blank values", () => {
+    assert.equal(isServiceFormUrl(""), false);
+    assert.equal(isServiceFormUrl("   "), false);
+    assert.equal(isServiceFormUrl("javascript:alert(1)"), false);
+    assert.equal(isServiceFormUrl("data:text/plain,x"), false);
+    assert.equal(isServiceFormUrl("ftp://x.test/wms"), false);
+    assert.equal(isServiceFormUrl("/geoserver/wms has space"), false);
+    // Protocol-relative URLs share only the scheme, not the origin; the app
+    // must never treat a foreign host as same-origin (and the dev CORS proxy
+    // would skip them too).
+    assert.equal(isServiceFormUrl("//example.com/geoserver/wms"), false);
+    assert.equal(isServiceFormUrl("//attacker.example/wms"), false);
+    // A scheme without a host is not a usable endpoint: reject here rather
+    // than throwing from new URL() in the request builders.
+    assert.equal(isServiceFormUrl("https://"), false);
+    assert.equal(isServiceFormUrl("http://"), false);
+    assert.equal(isServiceFormUrl("https://host"), true);
+    assert.equal(isServiceFormUrl("https://x.test/wms"), true);
+  });
+});
+
+describe("serviceRequestErrorMessage", () => {
+  it("maps a network/TLS/CORS failure to the localized network message", () => {
+    assert.equal(
+      serviceRequestErrorMessage(new TypeError("Failed to fetch"), fakeT, "fallback"),
+      "addData.common.networkFailure",
+    );
+  });
+
+  it("maps a native TLS error string to the localized network message", () => {
+    assert.equal(
+      serviceRequestErrorMessage("Request failed: invalid peer certificate", fakeT, "fallback"),
+      "addData.common.networkFailure",
+    );
+  });
+
+  it("maps a timeout to the localized timeout message", () => {
+    assert.equal(
+      serviceRequestErrorMessage(new Error("The request timed out."), fakeT, "fallback"),
+      "addData.common.requestTimedOut",
+    );
+  });
+
+  it("falls through to the error's own message for an unclassified failure", () => {
+    assert.equal(
+      serviceRequestErrorMessage(
+        new Error("The WFS service returned an error."),
+        fakeT,
+        "fallback",
+      ),
+      "The WFS service returned an error.",
+    );
+  });
+
+  it("uses the fallback when an unclassified error carries no message", () => {
+    assert.equal(serviceRequestErrorMessage({}, fakeT, "fallback"), "fallback");
+  });
+});
+
+describe("createBaseLayer", () => {
+  /** A collection of `count` points, enough to be classified as a point layer. */
+  function points(count = 3): FeatureCollection {
+    return {
+      type: "FeatureCollection",
+      features: Array.from({ length: count }, (_, index) => ({
+        type: "Feature" as const,
+        properties: {},
+        geometry: { type: "Point" as const, coordinates: [index, index] },
+      })),
+    };
+  }
+
+  /** Puts `layer` in the store so the next createBaseLayer call can see it. */
+  function addToStore(layer: GeoLibreLayer): void {
+    useAppStore.getState().addLayer(layer);
+  }
+
+  beforeEach(() => {
+    useAppStore.getState().newProject({ name: "Add Data" });
+  });
+
+  it("leaves a non-vector layer on the flat schema defaults", () => {
+    const layer = createBaseLayer("Imagery", "xyz", { type: "raster" });
+    assert.deepEqual(layer.style, DEFAULT_LAYER_STYLE);
+  });
+
+  it("gives a vector layer a palette color and geometry-appropriate sizing", () => {
+    const layer = createBaseLayer(
+      "Cities",
+      "geojson",
+      { type: "geojson" },
+      {},
+      {
+        geojson: points(),
+      },
+    );
+    assert.equal(layer.style.fillColor, LAYER_PALETTE[0]);
+    assert.equal(layer.style.strokeColor, darkenHex(LAYER_PALETTE[0], 0.55));
+    // The point overrides, not DEFAULT_LAYER_STYLE's 6 / 0.6.
+    assert.equal(layer.style.circleRadius, 5);
+    assert.equal(layer.style.fillOpacity, 0.9);
+  });
+
+  it("does not repeat a palette color a layer already in the project wears", () => {
+    addToStore(createBaseLayer("First", "geojson", { type: "geojson" }, {}, { geojson: points() }));
+    const second = createBaseLayer(
+      "Second",
+      "geojson",
+      { type: "geojson" },
+      {},
+      {
+        geojson: points(),
+      },
+    );
+    assert.equal(second.style.fillColor, LAYER_PALETTE[1]);
+  });
+
+  it("gives each layer of one multi-layer import its own color", () => {
+    // The GPX case: both groups are built before either reaches the store, so
+    // only pendingLayers keeps the second off the first's color.
+    const first = createBaseLayer(
+      "Tracks",
+      "geojson",
+      { type: "geojson" },
+      {},
+      {
+        geojson: points(),
+      },
+    );
+    const second = createBaseLayer(
+      "Waypoints",
+      "geojson",
+      { type: "geojson" },
+      {},
+      {
+        geojson: points(),
+        pendingLayers: [first],
+      },
+    );
+    assert.equal(first.style.fillColor, LAYER_PALETTE[0]);
+    assert.equal(second.style.fillColor, LAYER_PALETTE[1]);
+  });
+
+  it("reserves no palette color for a layer that paints from no collection", () => {
+    // A non-spatial attribute table (delimited text with no coordinate columns)
+    // passes no geojson, so the next real vector layer still gets blue.
+    addToStore(createBaseLayer("Table", "geojson", { type: "geojson" }));
+    const next = createBaseLayer(
+      "Cities",
+      "geojson",
+      { type: "geojson" },
+      {},
+      {
+        geojson: points(),
+      },
+    );
+    assert.equal(next.style.fillColor, LAYER_PALETTE[0]);
+  });
+
+  it("enables simplestyle rendering when the collection carries those properties", () => {
+    const styled: FeatureCollection = {
+      type: "FeatureCollection",
+      features: [
+        {
+          type: "Feature",
+          properties: { "marker-color": "#ff0000" },
+          geometry: { type: "Point", coordinates: [0, 0] },
+        },
+      ],
+    };
+    assert.equal(
+      createBaseLayer("Feed", "geojson", { type: "geojson" }, {}, { geojson: styled }).style
+        .simpleStyleEnabled,
+      true,
+    );
+    assert.equal(
+      createBaseLayer("Plain", "geojson", { type: "geojson" }, {}, { geojson: points() }).style
+        .simpleStyleEnabled,
+      false,
+    );
+  });
+});
+
+describe("readLimitedBody", () => {
+  const streamed = (chunks: string[], headers: Record<string, string> = {}) =>
+    new Response(
+      new ReadableStream({
+        start(controller) {
+          for (const chunk of chunks) controller.enqueue(new TextEncoder().encode(chunk));
+          controller.close();
+        },
+      }),
+      { headers },
+    );
+
+  it("returns a body that fits within the ceiling", async () => {
+    const bytes = await readLimitedBody(streamed(["abcd", "efgh"]), 8);
+    assert.equal(new TextDecoder().decode(bytes), "abcdefgh");
+  });
+
+  it("refuses an advertised length over the ceiling before reading a byte", async () => {
+    await assert.rejects(
+      readLimitedBody(
+        new Response("{}", { headers: { "Content-Length": String(64 * 1024 * 1024) } }),
+        8,
+      ),
+      // Callers match on "download limit" to map either branch — the native
+      // `read_limited_body` or this one — onto their own error.
+      /download limit/,
+    );
+  });
+
+  it("stops a chunked body that streams past the ceiling", async () => {
+    await assert.rejects(readLimitedBody(streamed(["abcd", "efgh", "ijkl"]), 8), /download limit/);
+  });
+});
+
+describe("ZARR_GLOBE_SAMPLES", () => {
+  it("names ramps the form offers, increasing limits, and HTTPS stores", () => {
+    const ramps = new Set(VECTOR_COLOR_RAMPS.map((ramp) => ramp.value));
+    for (const sample of ZARR_GLOBE_SAMPLES) {
+      assert.ok(ramps.has(sample.colormap), `${sample.label}: ${sample.colormap}`);
+      assert.ok(sample.clim[1] > sample.clim[0], sample.label);
+      assert.equal(new URL(sample.url).protocol, "https:", sample.label);
+      assert.ok(sample.variable, sample.label);
+    }
+  });
+});

@@ -1,0 +1,13 @@
+# Bundled frontend apps, staged by `npm run build:embed` and `npm run build:mcp-app`.
+src/geolibre/static/
+
+# Python build artifacts
+dist/
+build/
+*.egg-info/
+__pycache__/
+.pytest_cache/
+
+# Jupyter and example run artifacts
+.ipynb_checkpoints/
+examples/*.geolibre.json

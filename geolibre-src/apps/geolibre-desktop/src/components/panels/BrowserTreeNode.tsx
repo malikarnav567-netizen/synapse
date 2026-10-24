@@ -1,0 +1,481 @@
+import { cn, Input } from "@geolibre/ui";
+import {
+  ChevronDown,
+  ChevronRight,
+  Clock,
+  Database,
+  Download,
+  File,
+  Folder,
+  FolderOpen,
+  Globe2,
+  Layers,
+  Loader2,
+  Pencil,
+  Plus,
+  Star,
+  Table,
+  Trash2,
+  Upload,
+  X,
+  type LucideIcon,
+} from "lucide-react";
+import { useRef, useState, type KeyboardEvent } from "react";
+import { useTranslation } from "react-i18next";
+import type { AddDataKind } from "../layout/AddDataDialog";
+import { isFavoritableKind } from "../../lib/browser-favorites";
+import type { BrowserNode } from "../../lib/browser-tree";
+
+interface BrowserTreeNodeProps {
+  node: BrowserNode;
+  /** Nesting depth, for the row's inline-start indent. */
+  depth: number;
+  /** Ids of the currently expanded group nodes. */
+  expanded: ReadonlySet<string>;
+  /** Id of the leaf whose activation is in flight, or null when idle. */
+  busyId: string | null;
+  /** Id of the row that is the tree's single tab stop (roving tabindex). */
+  activeRowId: string | null;
+  /** Sync the active row when a row receives focus (mouse click or Tab). */
+  onRowFocus: (id: string) => void;
+  /** Toggle a group node's expanded state. */
+  onToggle: (id: string) => void;
+  /** Activate a leaf (add a service/file layer, or open a recent project). */
+  onActivate: (node: BrowserNode) => void;
+  /** Open Add Data at `kind` for a group's "New connection" (＋) action. */
+  onNewConnection: (kind: AddDataKind) => void;
+  /** Pick a folder to pin, for the Files section's "Add folder" (＋) action. */
+  onAddFolder: () => void;
+  /** Unpin a pinned root folder (its ×), by path. */
+  onRemoveFolder: (path: string) => void;
+  /** Ids of currently-favorited nodes, for the star fill state. */
+  favoriteIds: ReadonlySet<string>;
+  /** Toggle a favoritable node's favorite state (its ☆/★). */
+  onToggleFavorite: (node: BrowserNode) => void;
+  /** Id of the node currently being renamed in place, or null. */
+  renamingId: string | null;
+  /** Start renaming a renamable node (its pencil). */
+  onBeginRename: (id: string) => void;
+  /** Commit a rename; a blank or unchanged name is a no-op for the caller. */
+  onCommitRename: (node: BrowserNode, name: string) => void;
+  /** Abandon the in-progress rename (Escape), by row id. */
+  onCancelRename: (id: string) => void;
+  /** Delete a saved Layer Library entry (its trash icon). */
+  onDeleteLibraryLayer: (node: BrowserNode) => void;
+  /** Forget a saved SQL Server connection (its trash icon). */
+  onForgetMssqlConnection: (node: BrowserNode) => void;
+  /** Forget a saved PostgreSQL connection (its trash icon). */
+  onForgetPostgresConnection: (node: BrowserNode) => void;
+  /** Import a Layer Library JSON bundle (the My Data section's ⬆). */
+  onImportLibrary: () => void;
+  /** Export the Layer Library as a JSON bundle (the My Data section's ⬇). */
+  onExportLibrary: () => void;
+}
+
+/** The leading icon for a node, chosen by kind (and expanded state for groups). */
+function nodeIcon(node: BrowserNode, isExpanded: boolean): LucideIcon {
+  switch (node.kind) {
+    case "recent-project":
+      return Clock;
+    case "service":
+      return Globe2;
+    case "connection":
+      return Database;
+    case "table":
+      return Table;
+    case "file":
+      return File;
+    case "library-layer":
+      return Layers;
+    case "arcgis-sublayer":
+      // A MapServer group layer expands like a folder; a leaf is a layer.
+      return node.children ? (isExpanded ? FolderOpen : Folder) : Layers;
+    default:
+      return isExpanded ? FolderOpen : Folder;
+  }
+}
+
+/**
+ * The in-place rename editor a `library-layer` row swaps in for its treeitem
+ * button. Enter commits, Escape abandons, and blur commits too so clicking away
+ * keeps the typed name rather than silently discarding it.
+ */
+function RenameRow({
+  node,
+  indentStart,
+  onCommit,
+  onCancel,
+}: {
+  node: BrowserNode;
+  indentStart: number;
+  onCommit: (name: string) => void;
+  onCancel: () => void;
+}) {
+  const { t } = useTranslation();
+  const [value, setValue] = useState(node.label);
+  // Enter and Escape both clear the parent's `renamingId`, which unmounts this
+  // editor — and removing the still-focused input fires a trailing blur. That
+  // blur is handled by the closure from the render before the key press, so a
+  // `useState` flag would be discarded with the unmounting component and never
+  // seen: Escape would commit the abandoned draft and Enter would commit twice.
+  // A ref is read live by that stale closure, so it actually suppresses the
+  // second commit (same guard as `handledRef` / `suppressBlurCommitRef` in
+  // LayerPanel, which exist for exactly this).
+  const handledRef = useRef(false);
+  const onKeyDown = (event: KeyboardEvent<HTMLInputElement>) => {
+    if (event.key === "Enter") {
+      event.preventDefault();
+      handledRef.current = true;
+      onCommit(value);
+    } else if (event.key === "Escape") {
+      event.preventDefault();
+      handledRef.current = true;
+      onCancel();
+    }
+  };
+  return (
+    <div className="flex flex-1 items-center py-0.5" style={{ paddingInlineStart: indentStart }}>
+      <Input
+        // The pencil hands focus straight to the editor it opened; without this
+        // the user would have to click the input they just asked for (same as
+        // the Layers panel's inline rename).
+        autoFocus
+        className="h-6 flex-1 px-1 py-0 text-sm"
+        aria-label={t("browser.renameLibraryLayer", { name: node.label })}
+        value={value}
+        onChange={(event) => setValue(event.target.value)}
+        onKeyDown={onKeyDown}
+        onBlur={() => {
+          // Clicking away still commits the typed name rather than discarding it.
+          if (!handledRef.current) onCommit(value);
+        }}
+      />
+    </div>
+  );
+}
+
+/**
+ * One row in the Browser tree, rendered recursively. Group nodes
+ * (section/category) toggle their children; leaf nodes (service/recent-project)
+ * activate on click. Indentation reflects depth.
+ */
+export function BrowserTreeNode({
+  node,
+  depth,
+  expanded,
+  busyId,
+  activeRowId,
+  onRowFocus,
+  onToggle,
+  onActivate,
+  onNewConnection,
+  onAddFolder,
+  onRemoveFolder,
+  favoriteIds,
+  onToggleFavorite,
+  renamingId,
+  onBeginRename,
+  onCommitRename,
+  onCancelRename,
+  onDeleteLibraryLayer,
+  onForgetMssqlConnection,
+  onForgetPostgresConnection,
+  onImportLibrary,
+  onExportLibrary,
+}: BrowserTreeNodeProps) {
+  const { t } = useTranslation();
+  // A status row (loading / error) is non-interactive text, not a tree control.
+  if (node.kind === "info") {
+    return (
+      // role="none" so the status row isn't an extra listitem in the tree.
+      <li role="none">
+        <p
+          className="truncate py-1 text-xs text-muted-foreground"
+          style={{ paddingInlineStart: 8 + depth * 14 }}
+          title={node.label}
+          // Announce the loading→tables/error transition to screen readers.
+          role="status"
+          aria-live="polite"
+        >
+          {node.label}
+        </p>
+      </li>
+    );
+  }
+  const isGroup = Boolean(node.children);
+  const isExpanded = expanded.has(node.id);
+  const Icon = nodeIcon(node, isExpanded);
+  const isBusy = busyId === node.id;
+  // A leaf is disabled while any activation is in flight (matching the guard in
+  // BrowserPanel.activate), so a click on a busy panel gives visible feedback
+  // rather than being silently swallowed.
+  const isDisabled = !isGroup && busyId != null;
+  // Indent by depth; groups reserve room for the chevron, leaves align to it.
+  const indentStart = 8 + depth * 14;
+  // The Add Data source this node's ＋ opens (or undefined). Captured as a const
+  // so its non-undefined narrowing survives into the onClick closure — a
+  // property access (node.newConnectionKind) would not, forcing a cast.
+  const newConnectionKind = node.newConnectionKind;
+  // Each service or database engine group names its ＋ after the displayed
+  // source, keeping the action specific for sighted and screen-reader users.
+  const newConnectionLabel = t("browser.newConnection", { kind: node.label });
+  // The trailing ＋ affordance: a service/database group opens Add Data; the
+  // Files section opens a folder picker. At most one applies per node.
+  const plusAction = newConnectionKind
+    ? { label: newConnectionLabel, run: () => onNewConnection(newConnectionKind) }
+    : node.addFolderAction
+      ? { label: t("browser.addFolder"), run: onAddFolder }
+      : null;
+  // Pinned root folders show a × to unpin them from the Files section.
+  const removePath = node.removable ? node.path : undefined;
+  // Favoritable nodes (services, connections, folders, files) show a star to
+  // pin/unpin them to the Favorites section.
+  const favoritable = isFavoritableKind(node.kind);
+  const favorited = favoritable && favoriteIds.has(node.id);
+  const isRenaming = renamingId === node.id;
+
+  return (
+    // role="none": the treeitem role lives on the inner button, so the <li>
+    // must not add a listitem role to the tree/group.
+    <li role="none">
+      <div className="group flex items-center">
+        {isRenaming ? (
+          <RenameRow
+            node={node}
+            indentStart={indentStart}
+            onCommit={(name) => onCommitRename(node, name)}
+            onCancel={() => onCancelRename(node.id)}
+          />
+        ) : (
+          <button
+            type="button"
+            disabled={isDisabled}
+            className={cn(
+              "flex min-w-0 flex-1 items-center gap-1.5 rounded px-2 py-1 text-start text-sm",
+              "hover:bg-accent hover:text-accent-foreground",
+              "disabled:pointer-events-none disabled:opacity-50",
+              node.kind === "section" && "font-semibold",
+            )}
+            style={{ paddingInlineStart: indentStart }}
+            role="treeitem"
+            aria-level={depth + 1}
+            aria-expanded={isGroup ? isExpanded : undefined}
+            aria-busy={isBusy || undefined}
+            // Roving tabindex: only the active row is a tab stop; the panel's
+            // Arrow-key handler moves the active row and focuses it.
+            tabIndex={node.id === activeRowId ? 0 : -1}
+            data-browser-row={node.id}
+            onFocus={() => onRowFocus(node.id)}
+            onClick={() => {
+              // Also sync from onClick: some browsers (WebKit) don't focus a
+              // button on mouse click, so onFocus alone would leave the roving
+              // active row stale after a click.
+              onRowFocus(node.id);
+              if (isGroup) onToggle(node.id);
+              else onActivate(node);
+            }}
+          >
+            {isGroup ? (
+              isExpanded ? (
+                <ChevronDown className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
+              ) : (
+                <ChevronRight className="h-3.5 w-3.5 shrink-0 text-muted-foreground rtl:rotate-180" />
+              )
+            ) : (
+              <span className="w-3.5 shrink-0" />
+            )}
+            {isBusy ? (
+              <Loader2 className="h-3.5 w-3.5 shrink-0 animate-spin text-muted-foreground" />
+            ) : (
+              <Icon className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
+            )}
+            <span className="truncate">{node.label}</span>
+            {node.deployment || node.builtin ? (
+              <span className="ms-1 shrink-0 rounded border px-1 text-[10px] uppercase leading-tight text-muted-foreground">
+                {node.deployment ? t("browser.configBadge") : t("browser.builtinBadge")}
+              </span>
+            ) : null}
+            {node.needsLocalFile ? (
+              // A saved layer whose features were too large to embed: only a host
+              // that can read its file path can re-add it.
+              <span className="ms-1 shrink-0 rounded border px-1 text-[10px] uppercase leading-tight text-muted-foreground">
+                {t("browser.desktopOnlyBadge")}
+              </span>
+            ) : null}
+            {typeof node.count === "number" && node.count > 0 ? (
+              <span className="ms-auto shrink-0 text-xs text-muted-foreground">{node.count}</span>
+            ) : null}
+          </button>
+        )}
+        {node.renamable && !isRenaming ? (
+          <button
+            type="button"
+            className="me-1 shrink-0 rounded p-1 text-muted-foreground opacity-0 hover:bg-accent hover:text-accent-foreground focus:opacity-100 group-hover:opacity-100"
+            title={t("browser.renameLibraryLayer", { name: node.label })}
+            aria-label={t("browser.renameLibraryLayer", { name: node.label })}
+            tabIndex={node.id === activeRowId ? 0 : -1}
+            onClick={() => onBeginRename(node.id)}
+          >
+            <Pencil className="h-3.5 w-3.5" />
+          </button>
+        ) : null}
+        {node.deletable && !isRenaming ? (
+          <button
+            type="button"
+            className="me-1 shrink-0 rounded p-1 text-muted-foreground opacity-0 hover:bg-accent hover:text-accent-foreground focus:opacity-100 group-hover:opacity-100"
+            title={t("browser.deleteLibraryLayer", { name: node.label })}
+            aria-label={t("browser.deleteLibraryLayer", { name: node.label })}
+            tabIndex={node.id === activeRowId ? 0 : -1}
+            onClick={() => onDeleteLibraryLayer(node)}
+          >
+            <Trash2 className="h-3.5 w-3.5" />
+          </button>
+        ) : null}
+        {node.kind === "connection" && node.mssqlConnectionId ? (
+          <button
+            type="button"
+            className="me-1 shrink-0 rounded p-1 text-muted-foreground opacity-0 hover:bg-accent hover:text-accent-foreground focus:opacity-100 group-hover:opacity-100"
+            title={t("browser.forgetMssqlConnection", { name: node.label })}
+            aria-label={t("browser.forgetMssqlConnection", { name: node.label })}
+            tabIndex={node.id === activeRowId ? 0 : -1}
+            onClick={() => onForgetMssqlConnection(node)}
+          >
+            <Trash2 className="h-3.5 w-3.5" />
+          </button>
+        ) : null}
+        {node.kind === "connection" && node.connectionString && !node.mssqlConnectionId ? (
+          <button
+            type="button"
+            className="me-1 shrink-0 rounded p-1 text-muted-foreground opacity-0 hover:bg-accent hover:text-accent-foreground focus:opacity-100 group-hover:opacity-100"
+            title={t("browser.forgetPostgresConnection", { name: node.label })}
+            aria-label={t("browser.forgetPostgresConnection", { name: node.label })}
+            tabIndex={node.id === activeRowId ? 0 : -1}
+            onClick={() => onForgetPostgresConnection(node)}
+          >
+            <Trash2 className="h-3.5 w-3.5" />
+          </button>
+        ) : null}
+        {node.libraryImportExport ? (
+          <>
+            <button
+              type="button"
+              className="me-1 shrink-0 rounded p-1 text-muted-foreground hover:bg-accent hover:text-accent-foreground"
+              title={t("browser.importLibrary")}
+              aria-label={t("browser.importLibrary")}
+              tabIndex={node.id === activeRowId ? 0 : -1}
+              onClick={onImportLibrary}
+            >
+              <Upload className="h-3.5 w-3.5" />
+            </button>
+            <button
+              type="button"
+              // Nothing to write out until something is saved, so the export
+              // button is disabled rather than erroring on an empty library.
+              disabled={!node.count}
+              className="me-1 shrink-0 rounded p-1 text-muted-foreground hover:bg-accent hover:text-accent-foreground disabled:pointer-events-none disabled:opacity-40"
+              title={t("browser.exportLibrary")}
+              aria-label={t("browser.exportLibrary")}
+              tabIndex={node.id === activeRowId ? 0 : -1}
+              onClick={onExportLibrary}
+            >
+              <Download className="h-3.5 w-3.5" />
+            </button>
+          </>
+        ) : null}
+        {favoritable ? (
+          <button
+            type="button"
+            className={cn(
+              "me-1 shrink-0 rounded p-1 hover:bg-accent hover:text-accent-foreground",
+              favorited
+                ? "text-amber-500"
+                : // Unpinned: reveal on row hover / keyboard focus to reduce clutter.
+                  "text-muted-foreground opacity-0 focus:opacity-100 group-hover:opacity-100",
+            )}
+            title={
+              favorited
+                ? t("browser.unfavorite", { name: node.label })
+                : t("browser.favorite", { name: node.label })
+            }
+            aria-label={
+              favorited
+                ? t("browser.unfavorite", { name: node.label })
+                : t("browser.favorite", { name: node.label })
+            }
+            aria-pressed={favorited}
+            tabIndex={node.id === activeRowId ? 0 : -1}
+            onClick={() => onToggleFavorite(node)}
+          >
+            <Star className={cn("h-3.5 w-3.5", favorited && "fill-current")} />
+          </button>
+        ) : null}
+        {removePath ? (
+          <button
+            type="button"
+            className="me-1 shrink-0 rounded p-1 text-muted-foreground hover:bg-accent hover:text-accent-foreground"
+            title={t("browser.unpinFolder", { name: node.label })}
+            aria-label={t("browser.unpinFolder", { name: node.label })}
+            tabIndex={node.id === activeRowId ? 0 : -1}
+            onClick={() => onRemoveFolder(removePath)}
+          >
+            <X className="h-3.5 w-3.5" />
+          </button>
+        ) : null}
+        {plusAction ? (
+          <button
+            type="button"
+            className="me-1 shrink-0 rounded p-1 text-muted-foreground hover:bg-accent hover:text-accent-foreground"
+            title={plusAction.label}
+            aria-label={plusAction.label}
+            tabIndex={node.id === activeRowId ? 0 : -1}
+            onClick={plusAction.run}
+          >
+            <Plus className="h-3.5 w-3.5" />
+          </button>
+        ) : null}
+      </div>
+      {isGroup && isExpanded ? (
+        node.children && node.children.length > 0 ? (
+          <ul role="group">
+            {node.children.map((child) => (
+              <BrowserTreeNode
+                key={child.id}
+                node={child}
+                depth={depth + 1}
+                expanded={expanded}
+                busyId={busyId}
+                activeRowId={activeRowId}
+                onRowFocus={onRowFocus}
+                onToggle={onToggle}
+                onActivate={onActivate}
+                onNewConnection={onNewConnection}
+                onAddFolder={onAddFolder}
+                onRemoveFolder={onRemoveFolder}
+                favoriteIds={favoriteIds}
+                onToggleFavorite={onToggleFavorite}
+                renamingId={renamingId}
+                onBeginRename={onBeginRename}
+                onCommitRename={onCommitRename}
+                onCancelRename={onCancelRename}
+                onDeleteLibraryLayer={onDeleteLibraryLayer}
+                onForgetMssqlConnection={onForgetMssqlConnection}
+                onForgetPostgresConnection={onForgetPostgresConnection}
+                onImportLibrary={onImportLibrary}
+                onExportLibrary={onExportLibrary}
+              />
+            ))}
+          </ul>
+        ) : (
+          // An expanded group with no children (e.g. Recent before any project
+          // is opened) shows a hint instead of a bare gap.
+          <p
+            className="truncate py-1 text-xs text-muted-foreground"
+            style={{ paddingInlineStart: indentStart + 14 }}
+          >
+            {t("browser.emptyGroup")}
+          </p>
+        )
+      ) : null}
+    </li>
+  );
+}

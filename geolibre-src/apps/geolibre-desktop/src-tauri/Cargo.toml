@@ -1,0 +1,129 @@
+[package]
+name = "geolibre-desktop"
+version = "3.4.0"
+description = "GeoLibre Desktop — lightweight cloud-native desktop GIS"
+authors = ["GeoLibre Contributors"]
+edition = "2021"
+
+[lib]
+name = "geolibre_desktop_lib"
+crate-type = ["lib", "cdylib", "staticlib"]
+
+[features]
+default = []
+native-duckdb = ["dep:duckdb"]
+# Mac App Store build: compiles out every command that downloads or spawns
+# external code (sidecar, Jupyter, Martin, uv, external plugin installs), which
+# the App Sandbox and App Store guideline 2.5.2 forbid. Mutually exclusive with
+# native-duckdb (see the compile_error! in src/lib.rs).
+mas = []
+
+# Optimize the release binary for size. The frontend assets dominate the binary,
+# but these still trim the Rust code: LTO + a single codegen unit let the linker
+# drop dead code across crates, `strip` removes symbols/debuginfo, `opt-level="s"`
+# favors size while keeping reasonable runtime speed, and `panic="abort"` drops
+# unwinding tables (a panic in the desktop shell terminates the app either way).
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = ["protocol-asset"] }
+tauri-plugin-dialog = "2"
+tauri-plugin-fs = { version = "2", features = ["watch"] }
+# Native geolocation on Android/iOS: ships the location manifest permissions and
+# drives the OS permission dialog for Field Collection / GPS Tracking, which the
+# WebView's navigator.geolocation cannot do on Android. On desktop it is inert
+# (the frontend only invokes it on mobile). This is a patched 2.3.2 release;
+# see vendor/tauri-plugin-geolocation/GEOLIBRE_PATCH.md before upgrading.
+tauri-plugin-geolocation = { path = "vendor/tauri-plugin-geolocation" }
+tauri-plugin-http = "2"
+tauri-plugin-opener = "2"
+# Persists the fs scope the folder picker grants, so Browser-panel pinned
+# folders stay readable across app restarts (no re-pick required).
+tauri-plugin-persisted-scope = { version = "2", features = ["protocol-asset"] }
+duckdb = { version = "1.10504.0", features = ["bundled", "parquet"], optional = true }
+chrono = { version = "0.4", default-features = false, features = ["std"] }
+# rustls-tls stays the default backend for every request. rustls-tls-native-roots
+# also trusts the OS/system certificate store (enterprise CAs). native-tls (which
+# drags in openssl-sys) is used only on the opt-in mTLS path for PKCS#12 client
+# certificates (issue #1220), so it is added per-target below — everywhere except
+# Android, where there is no such path and openssl-sys cannot cross-compile for
+# the NDK.
+reqwest = { version = "0.12", default-features = false, features = [
+  "blocking",
+  "cookies",
+  "rustls-tls",
+  "rustls-tls-native-roots",
+] }
+# Base64 carries plugin HTTP bodies (plugin_http.rs) across the IPC boundary.
+base64 = "0.23"
+flate2 = "1"
+tar = "0.4"
+zip = { version = "8", default-features = false, features = ["deflate"] }
+rusqlite = { version = "0.40", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha1 = "0.11"
+sha2 = "0.11"
+hmac = "0.13"
+# Pinned to 1.x on purpose: this must match the bincode version
+# `tauri-plugin-persisted-scope` uses to write its scope file, which
+# `PersistedScopeState` in src/lib.rs reads and rewrites. Dependabot is told to
+# skip major bumps in .github/dependabot.yml; see docs/maintenance.md.
+bincode = "1"
+# OS CSPRNG for the per-launch Jupyter token (already an indirect dep).
+getrandom = "0.4"
+tauri-plugin-deep-link = "2"
+
+# native-tls backs only the desktop mTLS PKCS#12 path (issue #1220). It pulls in
+# openssl-sys, which has no vendored/cross build for the Android NDK, so the
+# feature is added on every target except Android (the code that uses it is
+# likewise cfg'd out in src/lib.rs).
+[target.'cfg(not(target_os = "android"))'.dependencies]
+reqwest = { version = "0.12", default-features = false, features = ["native-tls"] }
+
+# File-manager launches on Windows and Linux start a second process. Forward
+# its project path to the existing window instead of opening a second workspace.
+[target.'cfg(any(target_os = "windows", target_os = "linux"))'.dependencies]
+tauri-plugin-single-instance = { version = "2", features = ["deep-link"] }
+
+# Runtime WebKitGTK version check (already an indirect dep via tauri/wry).
+[target."cfg(target_os = \"linux\")".dependencies]
+webkit2gtk-sys = "2"
+
+# Reclaiming ports 8765/8766 from a sidecar or Jupyter server orphaned by a
+# previous session (issues #1643, #2959): the IP Helper TCP table names the
+# process that owns the listening socket, and the process APIs (plus
+# NtQueryInformationProcess for the command line) let us check it is ours
+# before terminating it. Windows has no /proc, so the Linux path cannot be reused.
+# Already an indirect dep via tauri, so this adds no new crate to the build.
+[target."cfg(target_os = \"windows\")".dependencies]
+windows-sys = { version = "0.61", features = [
+  "Wdk_System_Threading",
+  "Win32_Foundation",
+  "Win32_NetworkManagement_IpHelper",
+  "Win32_System_Threading",
+] }
+# Reading the OAuth callback scheme's registered handler (#3042). Already an
+# indirect dep via tauri-plugin-deep-link, so this adds no new crate either.
+windows-registry = "0.6"
+
+# OS credential store for tokens and API keys saved in Settings (issue #1667).
+# Desktop only: mobile keeps the webview's localStorage path. Pinned to 3.6.3:
+# 4.x moved to the keyring-core store API and needs Rust 1.88. `vendored`
+# builds libdbus from source, so Linux builds need no libdbus-1-dev.
+[target.'cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))'.dependencies]
+keyring = { version = "=3.6.3", features = [
+  "apple-native",
+  "windows-native",
+  "sync-secret-service",
+  "crypto-rust",
+  "vendored",
+] }

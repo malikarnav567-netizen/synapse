@@ -1,0 +1,154 @@
+// Build the self-hosted JupyterLite site that the web build embeds in the
+// Notebook panel (an <iframe> pointed at apps/geolibre-desktop/public/jupyterlite/).
+//
+// JupyterLite is a full Jupyter UI running entirely in the browser on a Pyodide
+// (WASM) kernel — no server. The desktop (Tauri) build launches a real
+// JupyterLab server instead and does not use this output.
+//
+// This step needs the `jupyter lite` CLI (see
+// apps/geolibre-desktop/jupyterlite/requirements.txt:
+//   pip install -r apps/geolibre-desktop/jupyterlite/requirements.txt
+// ). It is intentionally **best-effort**: if the CLI is not installed, it logs a
+// warning and exits 0 so a Node-only `npm run build` still succeeds. When the
+// assets are absent the Notebook panel shows a "not built" message on web; run
+// this script (or install the deps) to enable it.
+//
+// Output: apps/geolibre-desktop/public/jupyterlite/  (git-ignored; Vite copies
+// public/ into dist/ at build time).
+
+import { spawnSync } from "node:child_process";
+import { copyFileSync, existsSync, mkdirSync, rmSync } from "node:fs";
+import { dirname, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
+
+const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
+const liteDir = resolve(repoRoot, "apps/geolibre-desktop/jupyterlite");
+const contentsDir = resolve(liteDir, "files");
+// The kernel-side `geolibre` client and the Welcome example both have a single
+// canonical copy under the backend (so the desktop launcher bundles/copies the
+// same files); stage them into the JupyterLite contents here so the web kernel
+// gets `import geolibre` and the same starter notebook.
+const notebookClientSrc = resolve(repoRoot, "backend/geolibre_server/notebook_client.py");
+const notebookClientDest = resolve(contentsDir, "geolibre.py");
+const welcomeSrc = resolve(repoRoot, "backend/geolibre_server/notebook_examples/Welcome.ipynb");
+const welcomeDest = resolve(contentsDir, "Welcome.ipynb");
+const outputDir = resolve(repoRoot, "apps/geolibre-desktop/public/jupyterlite");
+
+const isWin = process.platform === "win32";
+
+// The Mac App Store build cannot spawn the JupyterLab server (App Sandbox +
+// guideline 2.5.2), so its Notebook panel embeds the JupyterLite site exactly
+// like the web build and the site is NOT dead weight there. `tauri-build.mjs`
+// sets GEOLIBRE_MAS_BUILD=1 on the tauri CLI, which the beforeBuildCommand
+// inherits, so this is visible here.
+const IS_MAS_BUILD = process.env.GEOLIBRE_MAS_BUILD === "1";
+
+// Builds whose output *serves* the site and therefore cannot degrade gracefully
+// when it is missing. The Docker image sets this: nginx answers an unknown path
+// with index.html (`try_files $uri /index.html`), exactly as Tauri does, so a
+// missing site makes the Notebook panel render a second copy of GeoLibre inside
+// its iframe rather than fail visibly (GeoLibre#1851). Warning and exiting 0
+// there ships that silently, which is how the official image shipped without the
+// site for as long as it did.
+const IS_REQUIRED = IS_MAS_BUILD || process.env.GEOLIBRE_JUPYTERLITE_REQUIRED === "1";
+
+// Every other desktop (Tauri) build launches a real JupyterLab server, so the
+// static site is dead weight in the installer. Tauri sets TAURI_ENV_* on its
+// beforeBuildCommand; skip the build there. The plain web build and the embed
+// build (Jupyter widget) do not set it, so they still get the site.
+if (process.env.TAURI_ENV_PLATFORM && !IS_MAS_BUILD) {
+  console.log(
+    "[build-jupyterlite] Tauri build detected — skipping JupyterLite " +
+      "(desktop uses a real JupyterLab server).",
+  );
+  process.exit(0);
+}
+
+// `--if-missing` (used by the `predev` hook) builds only when the site is not
+// already present, so `npm run dev` pays the build cost once and is instant
+// afterwards. The authoritative `build`/`build:jupyterlite` paths omit the flag
+// and always rebuild so a changed client/config is picked up.
+const onlyIfMissing = process.argv.includes("--if-missing");
+if (onlyIfMissing && existsSync(resolve(outputDir, "lab", "index.html"))) {
+  console.log(
+    "[build-jupyterlite] JupyterLite site already present — skipping " +
+      "(run `npm run build:jupyterlite` to rebuild it).",
+  );
+  process.exit(0);
+}
+
+// Probe for the CLI. `jupyter lite --version` exits non-zero / ENOENT when the
+// jupyterlite-core package (or jupyter itself) is missing.
+const probe = spawnSync("jupyter", ["lite", "--version"], {
+  cwd: repoRoot,
+  shell: isWin,
+  stdio: "ignore",
+});
+
+if (probe.status !== 0) {
+  const install =
+    "  pip install -r apps/geolibre-desktop/jupyterlite/requirements.txt\n" +
+    "then re-run `npm run build:jupyterlite`.";
+  // Best-effort everywhere except the Mac App Store build, which has no
+  // JupyterLab server to fall back to: shipping it without the site leaves the
+  // Notebook panel pointing at a missing asset, and Tauri's asset resolver
+  // serves index.html for anything it cannot find, so the panel would render a
+  // second copy of GeoLibre inside its iframe. Fail the build instead.
+  if (IS_REQUIRED) {
+    const why = IS_MAS_BUILD
+      ? "the Mac App Store build embeds the JupyterLite site (it cannot spawn a " +
+        "Jupyter server)"
+      : "this build serves the JupyterLite site and GEOLIBRE_JUPYTERLITE_REQUIRED=1";
+    console.error(
+      "[build-jupyterlite] `jupyter lite` is not available, but " +
+        why +
+        ". Shipping without the site leaves the Notebook panel pointing at a " +
+        "missing asset, which is answered with index.html and renders a second " +
+        "copy of GeoLibre inside the iframe. Install the build deps:\n" +
+        install,
+    );
+    process.exit(1);
+  }
+  console.warn(
+    "[build-jupyterlite] `jupyter lite` is not available — skipping the " +
+      "JupyterLite build. Any build that embeds the site (web, embed) will " +
+      "have a Notebook panel that cannot load. To enable it, install the " +
+      "build deps:\n" +
+      install,
+  );
+  process.exit(0);
+}
+
+// Stage the kernel-side `geolibre` client and the Welcome example into the
+// contents (the dir holds only generated copies, so ensure it exists first).
+mkdirSync(contentsDir, { recursive: true });
+copyFileSync(notebookClientSrc, notebookClientDest);
+copyFileSync(welcomeSrc, welcomeDest);
+
+// Rebuild cleanly so stale assets from an older JupyterLite version don't linger.
+rmSync(outputDir, { recursive: true, force: true });
+
+const result = spawnSync(
+  "jupyter",
+  ["lite", "build", "--lite-dir", liteDir, "--contents", contentsDir, "--output-dir", outputDir],
+  {
+    cwd: repoRoot,
+    shell: isWin,
+    stdio: "inherit",
+  },
+);
+
+if (result.status !== 0) {
+  console.error("[build-jupyterlite] `jupyter lite build` failed.");
+  process.exit(result.status ?? 1);
+}
+
+if (!existsSync(resolve(outputDir, "lab", "index.html"))) {
+  console.error(
+    "[build-jupyterlite] build finished but lab/index.html is missing in " +
+      `${outputDir}. Check the JupyterLite output above.`,
+  );
+  process.exit(1);
+}
+
+console.log(`[build-jupyterlite] Built JupyterLite site into ${outputDir}`);

@@ -1,0 +1,503 @@
+import { describe, it } from "node:test";
+import assert from "node:assert/strict";
+import type { FeatureCollection } from "geojson";
+import {
+  buildChartBlock,
+  buildTableBlock,
+  DEFAULT_TABLE_ROWS,
+  layerRows,
+  MAX_TABLE_ROWS,
+  rowForAtlasFeature,
+  rowsIntersectingBounds,
+  rowsWithinBounds,
+} from "../apps/geolibre-desktop/src/lib/print-data-blocks";
+import { collectAtlasFeatures } from "../apps/geolibre-desktop/src/lib/print-atlas";
+import type { ChartRow } from "../apps/geolibre-desktop/src/lib/attribute-charts";
+
+function point(lng: number, lat: number, properties: Record<string, unknown>): GeoJSON.Feature {
+  return {
+    type: "Feature",
+    properties,
+    geometry: { type: "Point", coordinates: [lng, lat] },
+  };
+}
+
+function rows(...props: Record<string, unknown>[]): ChartRow[] {
+  return props.map((properties) => ({ properties }));
+}
+
+describe("rowsWithinBounds", () => {
+  const collection: Pick<FeatureCollection, "features"> = {
+    features: [
+      point(1, 1, { name: "inside" }),
+      point(50, 50, { name: "outside" }),
+      // No geometry: nowhere on the page, so never included.
+      {
+        type: "Feature",
+        properties: { name: "no-geometry" },
+        geometry: null as unknown as GeoJSON.Geometry,
+      },
+    ],
+  };
+
+  // The dialog precomputes per-feature bounds once per layer (the atlas
+  // pattern) and hands those to the filter.
+  const infos = collectAtlasFeatures(collection);
+
+  it("keeps only features fully within the extent", () => {
+    const result = rowsWithinBounds(infos, [0, 0, 10, 10]);
+    assert.deepEqual(
+      result.map((r) => r.properties.name),
+      ["inside"],
+    );
+  });
+
+  it("returns no rows for a fully disjoint extent", () => {
+    assert.equal(rowsWithinBounds(infos, [-30, -30, -20, -20]).length, 0);
+  });
+
+  it("rejects features that only clip the extent edge", () => {
+    const partial = collectAtlasFeatures({
+      features: [
+        {
+          type: "Feature",
+          properties: { name: "partial" },
+          geometry: {
+            type: "Polygon",
+            coordinates: [
+              [
+                [0, 0],
+                [5, 0],
+                [5, 5],
+                [0, 5],
+                [0, 0],
+              ],
+            ],
+          },
+        },
+      ],
+    });
+    assert.equal(rowsWithinBounds(partial, [4, 0, 8, 8]).length, 0);
+    assert.equal(rowsWithinBounds(partial, [-1, -1, 6, 6]).length, 1);
+  });
+
+  it("matches contained features across antimeridian longitude conventions", () => {
+    const dateline = collectAtlasFeatures({
+      features: [
+        {
+          type: "Feature",
+          properties: { name: "dateline" },
+          geometry: {
+            type: "Polygon",
+            coordinates: [
+              [
+                [179, -1],
+                [-179, -1],
+                [-179, 1],
+                [179, 1],
+                [179, -1],
+              ],
+            ],
+          },
+        },
+      ],
+    });
+    assert.equal(rowsWithinBounds(dateline, [170, -5, 190, 5]).length, 1);
+    assert.equal(rowsWithinBounds(dateline, [-190, -5, -170, 5]).length, 1);
+    assert.equal(rowsWithinBounds(dateline, [-10, -5, 10, 5]).length, 0);
+  });
+});
+
+describe("rowsIntersectingBounds", () => {
+  it("includes partially clipped features but excludes disjoint features", () => {
+    const infos = collectAtlasFeatures({
+      features: [
+        {
+          type: "Feature",
+          properties: { name: "partial" },
+          geometry: {
+            type: "Polygon",
+            coordinates: [
+              [
+                [0, 0],
+                [5, 0],
+                [5, 5],
+                [0, 5],
+                [0, 0],
+              ],
+            ],
+          },
+        },
+        point(20, 20, { name: "outside" }),
+      ],
+    });
+    assert.deepEqual(
+      rowsIntersectingBounds(infos, [4, 0, 8, 8]).map((row) => row.properties.name),
+      ["partial"],
+    );
+  });
+
+  it("uses geometry rather than bounding-box overlap", () => {
+    const infos = collectAtlasFeatures({
+      features: [
+        {
+          type: "Feature",
+          properties: { name: "frame" },
+          geometry: {
+            type: "Polygon",
+            coordinates: [
+              [
+                [0, 0],
+                [10, 0],
+                [10, 10],
+                [0, 10],
+                [0, 0],
+              ],
+              [
+                [2, 2],
+                [2, 8],
+                [8, 8],
+                [8, 2],
+                [2, 2],
+              ],
+            ],
+          },
+        },
+      ],
+    });
+    assert.equal(rowsIntersectingBounds(infos, [3, 3, 7, 7]).length, 0);
+  });
+
+  it("matches intersecting features across antimeridian longitude conventions", () => {
+    const infos = collectAtlasFeatures({
+      features: [
+        {
+          type: "Feature",
+          properties: { name: "dateline" },
+          geometry: {
+            type: "LineString",
+            coordinates: [
+              [179, 0],
+              [-179, 0],
+            ],
+          },
+        },
+      ],
+    });
+    assert.equal(rowsIntersectingBounds(infos, [178, -1, 180, 1]).length, 1);
+    assert.equal(rowsIntersectingBounds(infos, [-180, -1, -178, 1]).length, 1);
+    assert.equal(rowsIntersectingBounds(infos, [-10, -1, 10, 1]).length, 0);
+  });
+
+  it("matches a page extent several world copies from the canonical range", () => {
+    const infos = collectAtlasFeatures({
+      features: [
+        {
+          type: "Feature",
+          properties: { name: "dateline" },
+          geometry: {
+            type: "LineString",
+            coordinates: [
+              [179, 0],
+              [-179, 0],
+            ],
+          },
+        },
+      ],
+    });
+    // The map's unwrapped coordinates after panning two world copies east.
+    assert.equal(rowsIntersectingBounds(infos, [898, -1, 900, 1]).length, 1);
+    assert.equal(rowsWithinBounds(infos, [890, -1, 910, 1]).length, 1);
+    assert.equal(rowsIntersectingBounds(infos, [700, -1, 710, 1]).length, 0);
+  });
+
+  it("unwraps a raw getBounds() page extent reported as west > east", () => {
+    const infos = collectAtlasFeatures({
+      features: [
+        {
+          type: "Feature",
+          properties: { name: "dateline" },
+          geometry: {
+            type: "LineString",
+            coordinates: [
+              [179, 0],
+              [-179, 0],
+            ],
+          },
+        },
+        point(0, 0, { name: "greenwich" }),
+      ],
+    });
+    // MapLibre reports a Pacific view as west≈170, east≈-170; read literally
+    // that is the ~340°-wide Eurasian side, which holds "greenwich" instead.
+    assert.deepEqual(
+      rowsIntersectingBounds(infos, [170, -1, -170, 1]).map((row) => row.properties.name),
+      ["dateline"],
+    );
+    assert.deepEqual(
+      rowsWithinBounds(infos, [170, -1, -170, 1]).map((row) => row.properties.name),
+      ["dateline"],
+    );
+  });
+
+  it("shifts a feature touching +180 onto a page extent touching -180", () => {
+    const infos = collectAtlasFeatures({
+      features: [
+        {
+          type: "Feature",
+          properties: { name: "touches" },
+          geometry: {
+            type: "LineString",
+            coordinates: [
+              [170, 0],
+              [180, 0],
+            ],
+          },
+        },
+      ],
+    });
+    assert.equal(rowsIntersectingBounds(infos, [-180, -1, -170, 1]).length, 1);
+  });
+
+  it("shifts a dateline feature whose unwrapped bounds already overlap the extent", () => {
+    const infos = collectAtlasFeatures({
+      features: [
+        {
+          type: "Feature",
+          properties: { name: "dateline" },
+          geometry: {
+            type: "LineString",
+            coordinates: [
+              [179, 0],
+              [-179, 0],
+            ],
+          },
+        },
+      ],
+    });
+    // `geometryBounds` unwraps this to [179, 0, 181, 0], so the bbox prefilter
+    // matches at offset 0 — but the raw coordinates still run the other way
+    // around the globe and need the shift before the geometry test.
+    assert.equal(rowsIntersectingBounds(infos, [180.25, -1, 180.75, 1]).length, 1);
+  });
+
+  it("handles a GeometryCollection member", () => {
+    const infos = collectAtlasFeatures({
+      features: [
+        {
+          type: "Feature",
+          properties: { name: "collection" },
+          geometry: {
+            type: "GeometryCollection",
+            geometries: [
+              { type: "Point", coordinates: [50, 50] },
+              {
+                type: "LineString",
+                coordinates: [
+                  [1, 1],
+                  [4, 4],
+                ],
+              },
+            ],
+          },
+        },
+      ],
+    });
+    assert.equal(rowsIntersectingBounds(infos, [0, 0, 5, 5]).length, 1);
+    assert.equal(rowsIntersectingBounds(infos, [-20, -20, -10, -10]).length, 0);
+  });
+
+  it("drops a degenerate feature instead of throwing", () => {
+    const infos = collectAtlasFeatures({
+      features: [
+        // A ring with fewer than four positions is not a closed polygon.
+        {
+          type: "Feature",
+          properties: { name: "degenerate" },
+          geometry: {
+            type: "Polygon",
+            coordinates: [
+              [
+                [1, 1],
+                [4, 4],
+              ],
+            ],
+          },
+        },
+        point(2, 2, { name: "sound" }),
+      ],
+    });
+    assert.deepEqual(
+      rowsIntersectingBounds(infos, [0, 0, 5, 5]).map((row) => row.properties.name),
+      ["sound"],
+    );
+  });
+});
+
+describe("rowForAtlasFeature", () => {
+  it("uses the stable source index and handles an out-of-range page", () => {
+    const source = rows({ name: "a" }, { name: "b" }, { name: "c" });
+    assert.deepEqual(rowForAtlasFeature(source, 1), [source[1]]);
+    assert.deepEqual(rowForAtlasFeature(source, 99), []);
+  });
+});
+
+describe("layerRows", () => {
+  it("maps features to property bags, defaulting missing properties", () => {
+    const result = layerRows({
+      features: [
+        point(0, 0, { a: 1 }),
+        {
+          type: "Feature",
+          properties: null,
+          geometry: { type: "Point", coordinates: [0, 0] },
+        },
+      ],
+    });
+    assert.deepEqual(result, [{ properties: { a: 1 } }, { properties: {} }]);
+  });
+});
+
+describe("buildTableBlock", () => {
+  const source = rows(
+    { name: "b-town", pop: 200 },
+    { name: "a-town", pop: 300 },
+    { name: "c-town", pop: null },
+  );
+
+  it("returns null without rows or without columns", () => {
+    assert.equal(buildTableBlock([], { columns: ["name"] }), null);
+    assert.equal(buildTableBlock(source, { columns: [] }), null);
+  });
+
+  it("stringifies cells and blanks null/undefined values", () => {
+    const table = buildTableBlock(source, { columns: ["name", "pop", "nope"] });
+    assert.ok(table);
+    assert.deepEqual(table.columns, ["name", "pop", "nope"]);
+    assert.deepEqual(table.rows[0], ["b-town", "200", ""]);
+    assert.deepEqual(table.rows[2], ["c-town", "", ""]);
+    assert.equal(table.truncated, 0);
+  });
+
+  it("sorts numerically with missing values last, both directions", () => {
+    const asc = buildTableBlock(source, {
+      columns: ["name"],
+      sortField: "pop",
+    });
+    assert.deepEqual(
+      asc?.rows.map((r) => r[0]),
+      ["b-town", "a-town", "c-town"],
+    );
+    const desc = buildTableBlock(source, {
+      columns: ["name"],
+      sortField: "pop",
+      sortDescending: true,
+    });
+    assert.deepEqual(
+      desc?.rows.map((r) => r[0]),
+      ["a-town", "b-town", "c-town"],
+    );
+  });
+
+  it("caps rows at the limit and reports the truncated count", () => {
+    const many = rows(...Array.from({ length: 30 }, (_, i) => ({ id: i })));
+    const table = buildTableBlock(many, { columns: ["id"], maxRows: 5 });
+    assert.equal(table?.rows.length, 5);
+    assert.equal(table?.truncated, 25);
+    // Clamped into 1..MAX_TABLE_ROWS; non-finite falls back to the default.
+    assert.equal(buildTableBlock(many, { columns: ["id"], maxRows: 0 })?.rows.length, 1);
+    assert.equal(
+      buildTableBlock(many, { columns: ["id"], maxRows: 999 })?.rows.length,
+      Math.min(30, MAX_TABLE_ROWS),
+    );
+    assert.equal(
+      buildTableBlock(many, { columns: ["id"], maxRows: Number.NaN })?.rows.length,
+      DEFAULT_TABLE_ROWS,
+    );
+  });
+});
+
+describe("buildChartBlock", () => {
+  const source = rows({ kind: "a", v: 10 }, { kind: "a", v: 30 }, { kind: "b", v: 5 });
+
+  it("returns null for empty rows or incomplete configuration", () => {
+    assert.equal(buildChartBlock([], { type: "bar", categoryField: "kind" }), null);
+    assert.equal(buildChartBlock(source, { type: "bar" }), null);
+    assert.equal(buildChartBlock(source, { type: "line" }), null);
+    // sum/mean without a value field cannot aggregate.
+    assert.equal(
+      buildChartBlock(source, {
+        type: "bar",
+        categoryField: "kind",
+        aggregation: "sum",
+      }),
+      null,
+    );
+  });
+
+  it("builds a bar chart with counts, sorted descending, colored", () => {
+    const chart = buildChartBlock(source, {
+      type: "bar",
+      categoryField: "kind",
+      aggregation: "count",
+    });
+    assert.ok(chart && chart.kind === "bar");
+    assert.deepEqual(
+      chart.bars.map((b) => [b.label, b.value]),
+      [
+        ["a", 2],
+        ["b", 1],
+      ],
+    );
+    assert.equal(chart.maxValue, 2);
+    assert.ok(chart.bars.every((b) => /^#/.test(b.color)));
+  });
+
+  it("reports bar categories dropped past the top-N cap", () => {
+    const many = rows(...Array.from({ length: 25 }, (_, i) => ({ kind: `k${i}` })));
+    const chart = buildChartBlock(many, {
+      type: "bar",
+      categoryField: "kind",
+      aggregation: "count",
+    });
+    assert.ok(chart && chart.kind === "bar");
+    assert.equal(chart.bars.length, 20);
+    assert.equal(chart.truncated, 5);
+  });
+
+  it("builds a sum-aggregated pie whose slices carry the total", () => {
+    const chart = buildChartBlock(source, {
+      type: "pie",
+      categoryField: "kind",
+      aggregation: "sum",
+      valueField: "v",
+    });
+    assert.ok(chart && chart.kind === "pie");
+    assert.equal(chart.total, 45);
+    assert.deepEqual(
+      chart.slices.map((s) => [s.label, s.value]),
+      [
+        ["a", 40],
+        ["b", 5],
+      ],
+    );
+  });
+
+  it("builds a line chart over row order, skipping non-numeric rows", () => {
+    const chart = buildChartBlock(rows({ v: 1 }, { v: "x" }, { v: 3 }), {
+      type: "line",
+      valueField: "v",
+    });
+    assert.ok(chart && chart.kind === "line");
+    assert.deepEqual(
+      chart.points.map((p) => [p.index, p.value]),
+      [
+        [0, 1],
+        [2, 3],
+      ],
+    );
+    assert.equal(chart.min, 1);
+    assert.equal(chart.max, 3);
+    assert.equal(chart.length, 3);
+  });
+});

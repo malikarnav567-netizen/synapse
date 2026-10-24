@@ -1,0 +1,958 @@
+import {
+  createLayerLibraryEntryId,
+  parseLayerLibrary,
+  planLayerLibraryAdd,
+  serializeLayerLibrary,
+  unresolvedLayerLibraryJoins,
+  useAppStore,
+  type GeoLibreLayer,
+} from "@geolibre/core";
+import type { MapEngine } from "@geolibre/map";
+import { fetchArcGISMapServiceSublayers } from "@geolibre/plugins";
+import { Input, ScrollArea } from "@geolibre/ui";
+import { Search } from "lucide-react";
+import { useCallback, useMemo, useRef, useState, type KeyboardEvent, type RefObject } from "react";
+import { useTranslation } from "react-i18next";
+import { fetchMssqlBrowserTables, forgetMssqlBrowserConnection } from "../../lib/mssql-browser";
+import {
+  fetchPostgresBrowserTables,
+  confirmForgetPostgresBrowserConnection,
+} from "../../lib/postgres-browser";
+import {
+  isLoadableFilePath,
+  listDirectory,
+  openLocalDataFileWithFallback,
+  pickLocalDirectory,
+  saveTextFileWithFallback,
+} from "../../lib/tauri-io";
+import { pinFolder, unpinFolder } from "../../lib/browser-folders";
+import { addFavorite, isFavoritableKind, removeFavorite } from "../../lib/browser-favorites";
+import { createAppAPI } from "../../hooks/usePlugins";
+import { restoreLibraryLayer } from "../../lib/restore-library-layer";
+import { useBrowserTree } from "../../hooks/useBrowserTree";
+import {
+  augmentArcGISServices,
+  augmentConnections,
+  augmentFolders,
+  isArcGISMapServiceEntry,
+  type ArcGISServiceLoad,
+  filterBrowserTree,
+  flattenVisibleTree,
+  type BrowserNode,
+  type ConnectionLoads,
+  type FolderLoad,
+} from "../../lib/browser-tree";
+import { applyServiceEntry } from "../layout/add-data/apply-service";
+import { errorMessage } from "../layout/add-data/helpers";
+import { serviceFieldString } from "../layout/add-data/service-library";
+import type { AddDataKind } from "../layout/AddDataDialog";
+import { openAddData } from "../layout/add-data/open-add-data";
+import { BrowserTreeNode } from "./BrowserTreeNode";
+
+/** The `connection:` / `folder:` id prefixes (id = prefix + connString/path). */
+const CONNECTION_ID_PREFIX = "connection:";
+const MSSQL_CONNECTION_ID_PREFIX = "mssql-connection:";
+const FOLDER_ID_PREFIX = "folder:";
+/** The `service:` id prefix (id = prefix + saved-service id). */
+const SERVICE_ID_PREFIX = "service:";
+
+interface BrowserPanelProps {
+  mapControllerRef: RefObject<MapEngine | null>;
+  /**
+   * Open a recent project by path (shared with the toolbar's instance).
+   * Resolves to an error message to show inline, or null on success.
+   */
+  onOpenRecentProject: (path: string) => Promise<string | null>;
+  /**
+   * Add a local file (by absolute path) as a layer — vector/raster/MBTiles,
+   * dispatched by the shell which owns the store add-paths. Resolves to an error
+   * message to show inline, or null on success. Absent off-desktop (no Files
+   * section renders there).
+   */
+  onAddFilePath?: (path: string) => Promise<string | null>;
+}
+
+/** The section nodes are expanded by default so their contents are visible. */
+const DEFAULT_EXPANDED = new Set([
+  "section:favorites",
+  "section:my-data",
+  "section:services",
+  "section:recent",
+  "section:databases",
+  "database-engine:postgres",
+  "database-engine:mssql",
+  "section:files",
+]);
+
+/**
+ * Whether a layer records `path` as the file it was read from. The vector import
+ * puts the absolute path in `sourcePath`; the raster control puts it in
+ * `metadata.localFilePath` and keeps only the basename in `sourcePath`. Used to
+ * pick the layer a library re-add's file import just produced.
+ */
+function layerCameFromPath(layer: GeoLibreLayer, path: string): boolean {
+  return layer.sourcePath === path || layer.metadata.localFilePath === path;
+}
+
+/** Collects every group node id in a tree (used to expand-all while searching). */
+function collectGroupIds(nodes: readonly BrowserNode[], into: Set<string>): void {
+  for (const node of nodes) {
+    if (node.children) {
+      into.add(node.id);
+      collectGroupIds(node.children, into);
+    }
+  }
+}
+
+/**
+ * The Browser (Data Source Manager) panel — a QGIS-style tree that unifies the
+ * app's data entry points into one navigable surface. This MVP lists the
+ * saved-service library (grouped by kind) and recent projects; clicking a
+ * service adds it to the map via {@link applyServiceEntry}, and clicking a
+ * recent project opens it.
+ *
+ * Registered as a first-class dockable right panel (see useRegisterBrowserPanel),
+ * so the shell owns the panel chrome — title, move/merge/collapse/close buttons,
+ * and the left/right dock (defaulting to the shared Layers rail). This component
+ * renders only the panel body (search + tree).
+ */
+export function BrowserPanel({
+  mapControllerRef,
+  onOpenRecentProject,
+  onAddFilePath,
+}: BrowserPanelProps) {
+  const { t } = useTranslation();
+  const addLayer = useAppStore((s) => s.addLayer);
+  const renameLayerLibraryEntry = useAppStore((s) => s.renameLayerLibraryEntry);
+  const deleteLayerLibraryEntry = useAppStore((s) => s.deleteLayerLibraryEntry);
+  const { tree, serviceById, favoriteIds, libraryLayerById } = useBrowserTree();
+
+  const [query, setQuery] = useState("");
+  const [expanded, setExpanded] = useState<Set<string>>(() => new Set(DEFAULT_EXPANDED));
+  const [busyId, setBusyId] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  // Id of the My Data row whose name is being edited in place, or null.
+  const [renamingId, setRenamingId] = useState<string | null>(null);
+  // Ref mirror of renamingId, so the deferred focus restore in endRename can see
+  // whether another editor opened in the meantime (state would still be stale).
+  const renamingIdRef = useRef<string | null>(null);
+  const setRenaming = (id: string | null) => {
+    renamingIdRef.current = id;
+    setRenamingId(id);
+  };
+  // Ref mirror of busyId for the re-entrancy guard: two clicks dispatched
+  // back-to-back (before React commits the state update and the button's
+  // disabled prop) would both read a stale `busyId === null`, so the guard
+  // checks the ref, which is set synchronously (cf. isSavingRef in
+  // useProjectFileActions). The state drives the spinner/disabled UI.
+  const busyRef = useRef<string | null>(null);
+  const beginBusy = (id: string) => {
+    busyRef.current = id;
+    setBusyId(id);
+  };
+  const endBusy = () => {
+    busyRef.current = null;
+    setBusyId(null);
+  };
+
+  // Lazy PostGIS introspection: keyed by connection string, populated the first
+  // time a connection node is expanded so we never hit the sidecar for a
+  // connection the user hasn't opened.
+  const [connLoads, setConnLoads] = useState<ConnectionLoads>({});
+  // Tracks in-flight/settled fetches so a re-expand (or the expand-all a search
+  // triggers) doesn't refetch. A failed fetch drops its entry so re-expanding
+  // the connection retries (there is no separate refresh affordance).
+  const connFetchedRef = useRef<Set<string>>(new Set());
+  // A successful forget invalidates pending PostgreSQL requests for that DSN.
+  const connGenRef = useRef<Map<string, number>>(new Map());
+
+  // SQL Server introspection, keyed `mssql:<profile id>` so it merges with the
+  // PostGIS loads without colliding; same retry-on-failure tracking.
+  const [mssqlLoads, setMssqlLoads] = useState<ConnectionLoads>({});
+  const mssqlFetchedRef = useRef<Set<string>>(new Set());
+  const fetchMssqlTables = useCallback(
+    (connectionId: string) =>
+      fetchMssqlBrowserTables(connectionId, mssqlFetchedRef.current, setMssqlLoads, t),
+    [t],
+  );
+
+  const fetchConnectionTables = useCallback(
+    (connectionString: string) =>
+      fetchPostgresBrowserTables(
+        connectionString,
+        connFetchedRef.current,
+        connGenRef.current,
+        setConnLoads,
+        t,
+      ),
+    [t],
+  );
+
+  // Lazy directory listing for the Files section: keyed by absolute path,
+  // populated the first time a folder is expanded (same pattern as connections).
+  const [folderLoads, setFolderLoads] = useState<Record<string, FolderLoad>>({});
+  const folderFetchedRef = useRef<Set<string>>(new Set());
+  // Per-path fetch generation: bumped when a folder is (re)fetched or unpinned,
+  // so a slow listDirectory that resolves after the folder was unpinned/re-pinned
+  // can't clobber newer state with its stale result.
+  const folderGenRef = useRef<Map<string, number>>(new Map());
+
+  const fetchFolder = useCallback(
+    (path: string) => {
+      if (folderFetchedRef.current.has(path)) return;
+      folderFetchedRef.current.add(path);
+      const generation = (folderGenRef.current.get(path) ?? 0) + 1;
+      folderGenRef.current.set(path, generation);
+      const isCurrent = () => folderGenRef.current.get(path) === generation;
+      setFolderLoads((prev) => ({ ...prev, [path]: { status: "loading" } }));
+      listDirectory(path)
+        .then((entries) => {
+          if (!isCurrent()) return; // superseded by an unpin/re-pin mid-fetch
+          setFolderLoads((prev) => ({
+            ...prev,
+            [path]: { status: "loaded", entries },
+          }));
+        })
+        .catch((err: unknown) => {
+          if (!isCurrent()) return;
+          // Drop the marker so a re-expand retries (a folder can also change on
+          // disk); surface the message inline via the status row, using the
+          // translated fallback helper like fetchConnectionTables does.
+          folderFetchedRef.current.delete(path);
+          setFolderLoads((prev) => ({
+            ...prev,
+            [path]: {
+              status: "error",
+              message: errorMessage(err, t("browser.loadFolderFailed")),
+            },
+          }));
+        });
+    },
+    [t],
+  );
+
+  // Lazy ArcGIS MapServer sublayer listing, keyed by saved-service id and
+  // fetched the first time the service is expanded (GeoLibre#2780). Same
+  // retry-on-error contract as the connections above.
+  const [arcgisLoads, setArcgisLoads] = useState<Record<string, ArcGISServiceLoad>>({});
+  const arcgisFetchedRef = useRef<Set<string>>(new Set());
+
+  const fetchArcGISSublayers = useCallback(
+    (serviceId: string) => {
+      if (arcgisFetchedRef.current.has(serviceId)) return;
+      const entry = serviceById(serviceId);
+      if (!entry || !isArcGISMapServiceEntry(entry)) return;
+      arcgisFetchedRef.current.add(serviceId);
+      setArcgisLoads((prev) => ({
+        ...prev,
+        [serviceId]: { status: "loading" },
+      }));
+      // Saved services never carry a token, so this lists public services only,
+      // matching what activating the entry can draw.
+      fetchArcGISMapServiceSublayers({
+        url: serviceFieldString(entry.fields, "url"),
+      })
+        .then((sublayers) => {
+          // An empty listing may be a transient server answer, so re-expanding
+          // retries it like an error does.
+          if (sublayers.length === 0) arcgisFetchedRef.current.delete(serviceId);
+          setArcgisLoads((prev) => ({
+            ...prev,
+            [serviceId]:
+              sublayers.length > 0
+                ? { status: "loaded", sublayers }
+                : {
+                    status: "error",
+                    message: t("addData.arcgis.noSublayersFound"),
+                  },
+          }));
+        })
+        .catch((err: unknown) => {
+          arcgisFetchedRef.current.delete(serviceId);
+          setArcgisLoads((prev) => ({
+            ...prev,
+            [serviceId]: {
+              status: "error",
+              message: errorMessage(err, t("addData.arcgis.retrieveError")),
+            },
+          }));
+        });
+    },
+    [serviceById, t],
+  );
+
+  // Inject each connection node's lazily-loaded children (loading/error status
+  // rows, or schema→table nodes) before filtering. Search therefore reaches the
+  // tables of connections the user has already expanded; an unexpanded
+  // connection keeps its empty child list, so its tables aren't searchable
+  // until it is first drilled into. Folder listings are injected the same way.
+  const loadingLabel = t("browser.loadingTables");
+  const foldersLoadingLabel = t("browser.loadingFolder");
+  const arcgisLabels = useMemo(
+    () => ({
+      loading: t("browser.loadingSublayers"),
+      allLayers: t("browser.allSublayers"),
+    }),
+    [t],
+  );
+  const augmented = useMemo(
+    () =>
+      augmentArcGISServices(
+        augmentFolders(
+          augmentConnections(tree, { ...connLoads, ...mssqlLoads }, loadingLabel),
+          folderLoads,
+          foldersLoadingLabel,
+          isLoadableFilePath,
+          (shown, total) => t("browser.folderTruncated", { shown, total }),
+        ),
+        arcgisLoads,
+        arcgisLabels,
+      ),
+    [
+      tree,
+      connLoads,
+      mssqlLoads,
+      loadingLabel,
+      folderLoads,
+      foldersLoadingLabel,
+      arcgisLoads,
+      arcgisLabels,
+      t,
+    ],
+  );
+
+  const filtered = useMemo(() => filterBrowserTree(augmented, query), [augmented, query]);
+
+  // While searching, expand every group so matches deep in the tree are
+  // visible without the user hunting for them; otherwise use their choices.
+  const effectiveExpanded = useMemo(() => {
+    if (!query.trim()) return expanded;
+    const all = new Set(expanded);
+    collectGroupIds(filtered, all);
+    return all;
+  }, [query, expanded, filtered]);
+
+  const toggle = (id: string) => {
+    // Kick off introspection/listing the first time a connection or folder is
+    // expanded.
+    if (id.startsWith(CONNECTION_ID_PREFIX) && !expanded.has(id)) {
+      fetchConnectionTables(id.slice(CONNECTION_ID_PREFIX.length));
+    } else if (id.startsWith(MSSQL_CONNECTION_ID_PREFIX) && !expanded.has(id)) {
+      fetchMssqlTables(id.slice(MSSQL_CONNECTION_ID_PREFIX.length));
+    } else if (id.startsWith(FOLDER_ID_PREFIX) && !expanded.has(id)) {
+      fetchFolder(id.slice(FOLDER_ID_PREFIX.length));
+    } else if (id.startsWith(SERVICE_ID_PREFIX) && !expanded.has(id)) {
+      fetchArcGISSublayers(id.slice(SERVICE_ID_PREFIX.length));
+    }
+    setExpanded((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+  };
+
+  // Keyboard navigation (WAI-ARIA tree pattern). The visible rows, flattened
+  // top-to-bottom, are what Arrow Up/Down step through; Right/Left expand/
+  // collapse or move to child/parent. Roving tabindex: only `activeRowId` is
+  // tab-reachable, so the whole tree is one Tab stop and arrows move within it.
+  const treeRef = useRef<HTMLUListElement>(null);
+  const visibleRows = useMemo(
+    // "info" rows (loading/error status) are non-interactive text, not tree
+    // items, so they're excluded from keyboard navigation.
+    () => flattenVisibleTree(filtered, effectiveExpanded).filter((row) => row.kind !== "info"),
+    [filtered, effectiveExpanded],
+  );
+  const [activeRowId, setActiveRowId] = useState<string | null>(null);
+  // Fall back to the first row when nothing is active yet, or the active row
+  // scrolled out of existence (filtered away / its parent collapsed).
+  const currentRowId =
+    activeRowId && visibleRows.some((row) => row.id === activeRowId)
+      ? activeRowId
+      : (visibleRows[0]?.id ?? null);
+
+  const focusRow = (id: string) => {
+    setActiveRowId(id);
+    // The button already exists (only its tabIndex flips), so focus it now
+    // rather than waiting for the roving-tabindex re-render. Escape only `"`/`\`
+    // for the quoted attribute value — CSS.escape is for identifiers and would
+    // wrongly escape the `:`/`/` that ids like `section:services` contain.
+    const escaped = id.replace(/["\\]/g, "\\$&");
+    const selector = `[data-browser-row="${escaped}"]`;
+    treeRef.current?.querySelector<HTMLElement>(selector)?.focus();
+  };
+
+  const onTreeKeyDown = (event: KeyboardEvent<HTMLUListElement>) => {
+    // Only navigate when a treeitem row is focused. A row's secondary buttons
+    // (star/×/＋) are Tab-reachable; an Arrow key fired from one of those must
+    // not hijack nav and yank focus to another row.
+    if (!(event.target instanceof HTMLElement) || !event.target.hasAttribute("data-browser-row")) {
+      return;
+    }
+    if (!currentRowId) return;
+    const index = visibleRows.findIndex((row) => row.id === currentRowId);
+    if (index === -1) return;
+    const row = visibleRows[index];
+    let targetId: string | null | undefined;
+    // Horizontal arrows follow the reading direction (WAI-ARIA tree pattern):
+    // in a right-to-left layout ArrowLeft expands and ArrowRight collapses.
+    const isRtl = document.documentElement.dir === "rtl";
+    const key =
+      isRtl && event.key === "ArrowRight"
+        ? "ArrowLeft"
+        : isRtl && event.key === "ArrowLeft"
+          ? "ArrowRight"
+          : event.key;
+    switch (key) {
+      case "ArrowDown":
+        targetId = visibleRows[index + 1]?.id;
+        break;
+      case "ArrowUp":
+        targetId = visibleRows[index - 1]?.id;
+        break;
+      case "Home":
+        targetId = visibleRows[0]?.id;
+        break;
+      case "End":
+        targetId = visibleRows[visibleRows.length - 1]?.id;
+        break;
+      case "ArrowRight":
+        if (row.isGroup && !row.isExpanded) {
+          event.preventDefault();
+          toggle(row.id); // expand in place
+          return;
+        }
+        // Move to the group's first navigable child. Found by parentId rather
+        // than positional adjacency, since the group's only children may be
+        // non-navigable info rows (a connection/folder still loading or errored)
+        // or it may be an empty group — in which case Right Arrow is a no-op.
+        if (row.isGroup && row.isExpanded) {
+          targetId = visibleRows.find((candidate) => candidate.parentId === row.id)?.id;
+        }
+        break;
+      case "ArrowLeft":
+        // Collapse only a genuinely-expanded group. During a search,
+        // effectiveExpanded force-expands matching groups that aren't in the
+        // raw `expanded` set, and toggling those would just re-add them (no
+        // visible collapse) — so for a search-only-expanded group, fall through
+        // to moving to the parent instead of silently doing nothing.
+        if (row.isGroup && row.isExpanded && expanded.has(row.id)) {
+          event.preventDefault();
+          toggle(row.id); // collapse in place
+          return;
+        }
+        targetId = row.parentId; // move to parent
+        break;
+      default:
+        return; // let Enter/Space reach the focused button's onClick natively
+    }
+    if (targetId) {
+      event.preventDefault();
+      focusRow(targetId);
+    }
+  };
+
+  const activate = async (node: BrowserNode) => {
+    // Ignore a second activation while one is still resolving (a fast
+    // double-click, or clicking another entry mid-fetch), so an async add
+    // cannot run twice and duplicate the layer.
+    if (busyRef.current != null) return;
+    setError(null);
+    if (node.kind === "service" && node.serviceId) {
+      const entry = serviceById(node.serviceId);
+      if (!entry) {
+        // The saved-service list is read when the panel opens, so an entry can
+        // vanish (removed via the Add Data dialog, or in another tab) between
+        // the tree being built and this click.
+        if (favoriteIds.has(node.id)) {
+          // A favorite can outlive its saved service (removed anywhere, with no
+          // change event to prune it). Self-heal: drop the dead favorite so it
+          // stops erroring on every click, and say why.
+          removeFavorite(node.id);
+          setError(t("browser.favoriteMissing"));
+        } else {
+          setError(t("browser.addFailed"));
+        }
+        return;
+      }
+      if (entry.kind === "csw") {
+        openAddData("csw", {
+          url: typeof entry.fields.endpoint === "string" ? entry.fields.endpoint : undefined,
+          // The entry saves the search term alongside the endpoint, so restore
+          // it too rather than reopening on an empty keyword field.
+          keyword: typeof entry.fields.keyword === "string" ? entry.fields.keyword : undefined,
+        });
+        return;
+      }
+      beginBusy(node.id);
+      try {
+        await applyServiceEntry(entry, { addLayer, mapControllerRef });
+      } catch (err) {
+        // applyServiceEntry's thrown messages are developer-facing fallbacks
+        // (see its JSDoc), so show the translated generic message to the user
+        // and keep the detail in the console for debugging.
+        console.error("Failed to add service", err);
+        setError(t("browser.addFailed"));
+      } finally {
+        endBusy();
+      }
+    } else if (node.kind === "arcgis-sublayer" && node.serviceId) {
+      const entry = serviceById(node.serviceId);
+      if (!entry) {
+        setError(t("browser.addFailed"));
+        return;
+      }
+      const sublayerId = node.arcgisSublayerId;
+      beginBusy(node.id);
+      try {
+        // A sublayer row draws just that sublayer (a group's "All layers" row,
+        // the whole group), named after it; the service's own "All layers" row
+        // (no id) adds the service exactly as it was saved.
+        await applyServiceEntry(
+          sublayerId === undefined
+            ? entry
+            : {
+                ...entry,
+                name: node.arcgisLayerName ?? node.label,
+                fields: {
+                  ...entry.fields,
+                  sublayers: node.arcgisSublayers ?? String(sublayerId),
+                  splitSublayers: false,
+                },
+              },
+          { addLayer, mapControllerRef },
+        );
+      } catch (err) {
+        console.error("Failed to add ArcGIS sublayer", err);
+        setError(t("browser.addFailed"));
+      } finally {
+        endBusy();
+      }
+    } else if (node.kind === "recent-project" && node.projectPath) {
+      // Keep the panel open until the open settles: the handler resolves to an
+      // error message (or null) rather than throwing, so surface it inline here
+      // instead of closing the panel and hiding it.
+      beginBusy(node.id);
+      try {
+        const openError = await onOpenRecentProject(node.projectPath);
+        if (openError) setError(openError);
+      } finally {
+        endBusy();
+      }
+    } else if (node.kind === "table" && node.mssqlConnectionId) {
+      // Open the SQL Server source with the saved profile and table preselected;
+      // the session and secret come from the keychain-backed session cache.
+      openAddData("mssql", {
+        mssql: {
+          connectionId: node.mssqlConnectionId,
+          schema: node.tableSchema,
+          table: node.tableName,
+        },
+      });
+    } else if (node.kind === "table" && node.connectionString) {
+      // Reuse the proven PostgreSQL Add Data flow (desktop Martin lifecycle) to
+      // add the table as a layer, opening it prefilled with this connection and
+      // table so the user only confirms.
+      openAddData("postgres", {
+        postgres: {
+          connection: node.connectionString,
+          schema: node.tableSchema,
+          table: node.tableName,
+        },
+      });
+    } else if (node.kind === "library-layer" && node.libraryLayerId) {
+      const entry = libraryLayerById(node.libraryLayerId);
+      if (!entry) {
+        // The tree renders straight off the store slice, so an entry can only
+        // be missing if it was deleted between render and click.
+        setError(t("browser.libraryLayerMissing"));
+        return;
+      }
+      const plan = planLayerLibraryAdd(entry, {
+        id: createLayerLibraryEntryId(),
+      });
+      if (plan.kind === "layer") {
+        // Re-add exactly like a project load does: put the layer record in the
+        // store so MapController.syncLayers builds its map output, then run the
+        // owning plugin's restore pass when the layer is control-painted (that
+        // pass, not the store sync, is what draws those layers). Held under the
+        // busy flag so a second click during the add cannot duplicate the layer.
+        // Note the flag only covers dispatching the restore, not the re-ingest
+        // that follows: see `restoreLibraryLayer` on why four of the five passes
+        // cannot be awaited to completion.
+        beginBusy(node.id);
+        try {
+          // A saved join points at another layer by its project-local id, so it
+          // only resolves when that layer is present here. Checked before the add
+          // so the layer's own id cannot count as a match, and reported because
+          // the join engine drops an unresolved join silently.
+          const unresolvedJoins = unresolvedLayerLibraryJoins(
+            entry,
+            useAppStore.getState().layers.map((l) => l.id),
+          );
+          addLayer(plan.layer);
+          await restoreLibraryLayer(plan.layer, createAppAPI(mapControllerRef));
+          if (unresolvedJoins.length > 0) {
+            setError(
+              t("browser.libraryLayerJoinsUnresolved", {
+                count: unresolvedJoins.length,
+              }),
+            );
+          }
+        } finally {
+          endBusy();
+        }
+        return;
+      }
+      // Entries whose features were too large to embed carry only a file path,
+      // so re-adding needs the desktop host's filesystem read.
+      if (!onAddFilePath) {
+        setError(t("browser.libraryLayerNeedsDesktop"));
+        return;
+      }
+      beginBusy(node.id);
+      try {
+        // The file import builds a fresh, default-styled layer, so the entry's
+        // saved configuration is applied to it afterwards — otherwise a degraded
+        // entry would silently come back unstyled. `onAddFilePath` reports only
+        // success or an error message (one file can yield several layers — a KML
+        // adds placemarks plus ground overlays and models), so the target is
+        // found among the newly-added ids by matching the path this add used.
+        // That stays correct if an unrelated layer lands concurrently, and
+        // patches nothing rather than the wrong layer if none matches.
+        const idsBefore = new Set(useAppStore.getState().layers.map((l) => l.id));
+        const addError = await onAddFilePath(plan.path);
+        if (addError) {
+          setError(addError);
+        } else {
+          const added = useAppStore.getState().layers.filter((l) => !idsBefore.has(l.id));
+          const matches = added.filter((l) => layerCameFromPath(l, plan.path));
+          const target =
+            matches.length === 1
+              ? matches[0]
+              : // Nothing recorded the path (a format that keeps neither): a lone
+                // new layer is still unambiguous. Several matches are not — one
+                // file can yield siblings that share a path (a KML's placemarks
+                // plus its ground overlays) — so patch none of them.
+                matches.length === 0 && added.length === 1
+                ? added[0]
+                : undefined;
+          if (target) {
+            const { joins, virtualFields, ...rest } = plan.config;
+            useAppStore.getState().updateLayer(target.id, rest);
+            // Joins and virtual fields must go through their own actions so the
+            // derived columns are materialized rather than stored inert.
+            if (joins) useAppStore.getState().setLayerJoins(target.id, joins);
+            if (virtualFields) {
+              useAppStore.getState().setLayerVirtualFields(target.id, virtualFields);
+            }
+          } else {
+            // Either the import produced several indistinguishable layers, or it
+            // reported success while adding none. Both leave the entry's saved
+            // configuration unapplied, so say so rather than letting the user
+            // discover their styling silently did not return.
+            setError(
+              t("browser.libraryLayerConfigNotApplied", {
+                name: plan.config.name,
+              }),
+            );
+          }
+        }
+      } finally {
+        endBusy();
+      }
+    } else if (node.kind === "file" && node.path && onAddFilePath) {
+      // Add the clicked file as a layer via the shell's dispatcher (which owns
+      // the vector/raster/MBTiles store add-paths); it resolves to an error
+      // message or null, surfaced inline like the recent-project open.
+      beginBusy(node.id);
+      try {
+        const addError = await onAddFilePath(node.path);
+        if (addError) setError(addError);
+      } finally {
+        endBusy();
+      }
+    }
+  };
+
+  // A group's "New connection" (＋) opens the Add Data dialog at that source;
+  // saving there adds it to the library/connections, which show up in this tree.
+  const newConnection = (kind: AddDataKind) => openAddData(kind);
+
+  // The Files section's ＋ picks a folder to pin (native directory dialog); the
+  // pinned-folders change event refreshes the tree via useBrowserTree.
+  const addFolder = async () => {
+    setError(null);
+    try {
+      const picked = await pickLocalDirectory();
+      if (picked) pinFolder(picked);
+    } catch (err) {
+      console.error("Failed to add folder", err);
+      setError(t("browser.addFolderFailed"));
+    }
+  };
+
+  // A pinned root folder's (×) unpins it from the Files section. Also reset the
+  // folder and any expanded descendants — clear their cached listings + fetch
+  // markers and collapse them — so re-pinning the same path re-reads from disk
+  // and expands cleanly (toggle only fetches on a collapsed→expanded change;
+  // the panel stays mounted while hidden, so this state would otherwise persist).
+  //
+  // Note: this removes the pin from the UI/localStorage but does NOT revoke the
+  // underlying fs scope the picker granted (persisted app-wide via
+  // tauri-plugin-persisted-scope, see src-tauri/src/lib.rs) — there is no clean
+  // per-path "forget". Unpin means "stop listing it here", not "revoke access".
+  const removeFolder = (path: string) => {
+    setError(null);
+    // `path` may itself end in a separator (a normalized root: "/" or "C:\"),
+    // so build the descendant prefix from the path's own trailing separator
+    // rather than blindly appending one (which would yield "//" / "C:\\" and
+    // match no real descendant).
+    const separator = path.includes("\\") ? "\\" : "/";
+    const prefix = path.endsWith(separator) ? path : `${path}${separator}`;
+    const isWithin = (candidate: string) => candidate === path || candidate.startsWith(prefix);
+    for (const key of [...folderFetchedRef.current]) {
+      if (isWithin(key)) folderFetchedRef.current.delete(key);
+    }
+    // Invalidate any in-flight fetch for the folder/descendants so a late
+    // resolution can't repopulate cleared state.
+    for (const key of [...folderGenRef.current.keys()]) {
+      if (isWithin(key)) {
+        folderGenRef.current.set(key, (folderGenRef.current.get(key) ?? 0) + 1);
+      }
+    }
+    setFolderLoads((prev) => {
+      const next: Record<string, FolderLoad> = {};
+      for (const [key, value] of Object.entries(prev)) {
+        if (!isWithin(key)) next[key] = value;
+      }
+      return next;
+    });
+    setExpanded((prev) => {
+      const next = new Set(prev);
+      for (const id of prev) {
+        if (id.startsWith(FOLDER_ID_PREFIX) && isWithin(id.slice(FOLDER_ID_PREFIX.length))) {
+          next.delete(id);
+        }
+      }
+      return next;
+    });
+    unpinFolder(path);
+  };
+
+  // Toggle a node's presence in the Favorites section; the favorites change
+  // event refreshes the tree via useBrowserTree. Snapshot only display metadata
+  // and stable identity; activating a service resolves its current definition
+  // from the library rather than persisting deployment configuration here.
+  const toggleFavorite = (node: BrowserNode) => {
+    if (favoriteIds.has(node.id)) {
+      removeFavorite(node.id);
+      return;
+    }
+    const kind = node.kind;
+    if (!isFavoritableKind(kind)) return;
+    addFavorite({
+      id: node.id,
+      kind,
+      label: node.label,
+      serviceId: node.serviceId,
+      serviceKind: node.serviceKind,
+      builtin: node.builtin,
+      deployment: node.deployment,
+      path: node.path,
+    });
+  };
+
+  // My Data rename/delete. The store slice drives the tree, so both changes are
+  // reflected (and persisted to IndexedDB) with no refresh event to fire.
+  // Closing the editor unmounts the focused input, which would drop a
+  // keyboard-only user's focus to <body> and lose their place in the tree, so
+  // hand focus back to the row. Deferred a frame because the row's button does
+  // not exist again until this state change has rendered.
+  const endRename = (rowId: string) => {
+    setRenaming(null);
+    requestAnimationFrame(() => {
+      // Clicking a second row's pencil commits this one by blur, and that row's
+      // editor has already mounted and taken focus by the time this frame runs —
+      // so only reclaim focus if no editor is open, or the deferred call would
+      // yank it out of the input the user just asked for.
+      if (renamingIdRef.current === null) focusRow(rowId);
+    });
+  };
+
+  const commitRename = (node: BrowserNode, name: string) => {
+    endRename(node.id);
+    if (node.libraryLayerId) renameLayerLibraryEntry(node.libraryLayerId, name);
+  };
+
+  const deleteLibraryLayer = (node: BrowserNode) => {
+    setError(null);
+    if (!node.libraryLayerId) return;
+    // Leave no rename editor open on a row that no longer exists.
+    if (renamingId === node.id) setRenaming(null);
+    // The trash button being removed held focus, so send it to the section header
+    // — the nearest row that survives the delete — rather than letting it fall to
+    // <body> and lose the user's place (same reason as endRename above).
+    const fallbackRowId = visibleRows.find((row) => row.id === node.id)?.parentId ?? undefined;
+    deleteLayerLibraryEntry(node.libraryLayerId);
+    if (fallbackRowId) requestAnimationFrame(() => focusRow(fallbackRowId));
+  };
+  const forgetMssqlConnectionNode = (node: BrowserNode) => {
+    const profileId = node.mssqlConnectionId;
+    if (node.kind !== "connection" || !profileId) return;
+    if (!window.confirm(t("addData.mssql.forgetConnectionConfirm", { name: node.label }))) return;
+    if (favoriteIds.has(node.id)) removeFavorite(node.id);
+    forgetMssqlBrowserConnection(profileId, mssqlFetchedRef.current, setMssqlLoads);
+    const fallbackRowId = visibleRows.find((row) => row.id === node.id)?.parentId;
+    if (fallbackRowId) requestAnimationFrame(() => focusRow(fallbackRowId));
+  };
+
+  const forgetPostgresConnectionNode = (node: BrowserNode) => {
+    if (
+      !confirmForgetPostgresBrowserConnection(
+        node,
+        connFetchedRef.current,
+        connGenRef.current,
+        setConnLoads,
+        setExpanded,
+        t,
+      )
+    )
+      return;
+    const fallbackRowId = visibleRows.find((row) => row.id === node.id)?.parentId;
+    if (fallbackRowId) requestAnimationFrame(() => focusRow(fallbackRowId));
+  };
+
+  // Import/export the whole library as a JSON bundle, matching how the Style
+  // Manager shares its presets. Ids collide on purpose so re-importing an
+  // exported bundle updates entries instead of duplicating them.
+  const importLibrary = async () => {
+    setError(null);
+    try {
+      const picked = await openLocalDataFileWithFallback({
+        filters: [{ name: t("browser.libraryFilterName"), extensions: ["json"] }],
+        accept: ".json,application/json",
+        readText: true,
+      });
+      if (!picked || picked.text === undefined) return;
+      const imported = parseLayerLibrary(picked.text);
+      // Read the library fresh from the store: the file picker above can block
+      // while another surface saves a layer.
+      const current = useAppStore.getState().layerLibrary;
+      const byId = new Map(imported.map((e) => [e.id, e]));
+      // Genuinely new entries lead the list and the rest keep their places, so
+      // an import reads like a save (most recent first, per saveLayerLibraryEntry)
+      // instead of burying the freshly shared layers under the whole library.
+      // An id already present is an in-place update, not a reorder.
+      const updated = current.map((e) => byId.get(e.id) ?? e);
+      const currentIds = new Set(current.map((e) => e.id));
+      const added = imported.filter((e) => !currentIds.has(e.id));
+      useAppStore.getState().setLayerLibrary([...added, ...updated]);
+    } catch (err) {
+      // parseLayerLibrary's messages name the specific problem (bad JSON,
+      // unsupported version, no usable entries), so surface them directly.
+      setError(err instanceof Error ? err.message : t("browser.libraryImportFailed"));
+    }
+  };
+
+  const exportLibrary = async () => {
+    setError(null);
+    const entries = useAppStore.getState().layerLibrary;
+    if (entries.length === 0) return;
+    try {
+      await saveTextFileWithFallback(serializeLayerLibrary(entries), {
+        defaultName: "geolibre-layers.json",
+        filters: [{ name: t("browser.libraryFilterName"), extensions: ["json"] }],
+        browserTypes: [
+          {
+            description: t("browser.libraryFilterName"),
+            accept: { "application/json": [".json"] },
+          },
+        ],
+        mimeType: "application/json",
+      });
+    } catch (err) {
+      console.error("Failed to export the layer library", err);
+      setError(t("browser.libraryExportFailed"));
+    }
+  };
+
+  // Databases always has engine-group children with their own ＋ actions;
+  // Files likewise keeps its Add-folder action available on an empty list.
+  const hasContent = filtered.some(
+    (section) =>
+      section.children?.length ||
+      section.newConnectionKind ||
+      section.addFolderAction ||
+      section.libraryImportExport,
+  );
+
+  return (
+    // Body only: the shell (PluginRightPanel / SharedSidebar) renders the header,
+    // move/merge/collapse/close controls, and the dock rail around this.
+    <div className="flex h-full min-h-0 flex-col">
+      <div className="relative border-b px-2 py-2">
+        <Search className="pointer-events-none absolute start-4 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-muted-foreground" />
+        <Input
+          className="h-8 ps-7 text-sm"
+          placeholder={t("browser.searchPlaceholder")}
+          value={query}
+          aria-label={t("browser.searchPlaceholder")}
+          onChange={(event) => setQuery(event.target.value)}
+        />
+      </div>
+
+      {error ? <p className="border-b px-3 py-2 text-xs text-destructive">{error}</p> : null}
+
+      {/* Radix wraps the viewport content in `display: table; min-width: 100%`,
+          which sizes it to the widest row and defeats each label's `truncate`:
+          one long name (a deep MapServer sublayer) pushed every row's ＋/★
+          actions out of view. A block wrapper keeps rows at the panel width,
+          as LayerPanel does. */}
+      <ScrollArea className="min-h-0 flex-1 [&_[data-radix-scroll-area-viewport]>div]:block! [&_[data-radix-scroll-area-viewport]>div]:w-full! [&_[data-radix-scroll-area-viewport]>div]:min-w-0!">
+        {hasContent ? (
+          <ul
+            ref={treeRef}
+            className="py-1"
+            role="tree"
+            aria-label={t("browser.title")}
+            aria-busy={busyId != null}
+            onKeyDown={onTreeKeyDown}
+          >
+            {filtered.map((section) => (
+              <BrowserTreeNode
+                key={section.id}
+                node={section}
+                depth={0}
+                expanded={effectiveExpanded}
+                busyId={busyId}
+                activeRowId={currentRowId}
+                onRowFocus={setActiveRowId}
+                onToggle={toggle}
+                onActivate={activate}
+                onNewConnection={newConnection}
+                onAddFolder={addFolder}
+                onRemoveFolder={removeFolder}
+                favoriteIds={favoriteIds}
+                onToggleFavorite={toggleFavorite}
+                renamingId={renamingId}
+                onBeginRename={setRenaming}
+                onCommitRename={commitRename}
+                onCancelRename={endRename}
+                onDeleteLibraryLayer={deleteLibraryLayer}
+                onForgetMssqlConnection={forgetMssqlConnectionNode}
+                onImportLibrary={() => void importLibrary()}
+                onForgetPostgresConnection={forgetPostgresConnectionNode}
+                onExportLibrary={() => void exportLibrary()}
+              />
+            ))}
+          </ul>
+        ) : (
+          <p className="px-3 py-6 text-center text-xs text-muted-foreground">
+            {query.trim() ? t("browser.noMatches") : t("browser.empty")}
+          </p>
+        )}
+      </ScrollArea>
+    </div>
+  );
+}

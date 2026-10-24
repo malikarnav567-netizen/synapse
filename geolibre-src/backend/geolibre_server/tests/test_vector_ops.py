@@ -1,0 +1,1749 @@
+"""Tests for the framework-free vector_ops module.
+
+These lock the contract the in-browser Pyodide engine depends on:
+:func:`run_vector_tool` returns ``(feature_collection, messages)`` and raises
+plain ``ValueError`` / :class:`VectorInputTooLarge` (never ``HTTPException``) on
+bad input, and :func:`run_vector_tool_json` round-trips through JSON strings.
+"""
+
+import json
+from typing import NoReturn
+
+import pytest
+
+from geolibre_server import vector_ops
+from geolibre_server.vector_ops import (
+    VectorInputTooLarge,
+    run_vector_tool,
+    run_vector_tool_json,
+)
+
+try:
+    import geopandas  # noqa: F401
+
+    HAS_GEOPANDAS = True
+except Exception:  # pragma: no cover - depends on the optional extra
+    HAS_GEOPANDAS = False
+
+requires_geopandas = pytest.mark.skipif(
+    not HAS_GEOPANDAS, reason="geopandas optional extra not installed"
+)
+
+
+def _square(name: str, x: float = 0.0, y: float = 0.0) -> dict:
+    return {
+        "type": "FeatureCollection",
+        "features": [
+            {
+                "type": "Feature",
+                "properties": {"name": name},
+                "geometry": {
+                    "type": "Polygon",
+                    "coordinates": [
+                        [
+                            [x, y],
+                            [x, y + 1],
+                            [x + 1, y + 1],
+                            [x + 1, y],
+                            [x, y],
+                        ]
+                    ],
+                },
+            }
+        ],
+    }
+
+
+SQUARE = _square("a")
+OVERLAP = _square("b", x=0.5, y=0.5)
+DISJOINT = _square("c", x=10.0, y=10.0)
+EMPTY = {"type": "FeatureCollection", "features": []}
+POINT_IN_SQUARE = {
+    "type": "FeatureCollection",
+    "features": [
+        {
+            "type": "Feature",
+            "properties": {"name": "p"},
+            "geometry": {"type": "Point", "coordinates": [0.5, 0.5]},
+        }
+    ],
+}
+ANTIMERIDIAN_LAYER = {
+    "type": "FeatureCollection",
+    "features": [
+        {
+            "type": "Feature",
+            "properties": {"name": "fiji_tonga"},
+            "geometry": {
+                "type": "Polygon",
+                "coordinates": [
+                    [
+                        [175.0, -18.0],
+                        [-175.0, -18.0],
+                        [-175.0, -16.0],
+                        [175.0, -16.0],
+                        [175.0, -18.0],
+                    ]
+                ],
+            },
+        }
+    ],
+}
+
+
+def _attr_point(name: str, pop, x: float) -> dict:
+    return {
+        "type": "Feature",
+        "properties": {"name": name, "pop": pop},
+        "geometry": {"type": "Point", "coordinates": [x, 0.0]},
+    }
+
+
+# Attribute layer for Select by value: numeric "pop" with both a null (gamma) and
+# a feature that omits the key entirely (delta), plus a string "name".
+ATTR_LAYER = {
+    "type": "FeatureCollection",
+    "features": [
+        _attr_point("alpha", 10, 0.0),
+        _attr_point("beta", 20, 1.0),
+        _attr_point("gamma", None, 2.0),
+        {
+            "type": "Feature",
+            "properties": {"name": "delta"},  # no "pop" key at all
+            "geometry": {"type": "Point", "coordinates": [3.0, 0.0]},
+        },
+    ],
+}
+
+
+def test_unknown_tool_raises_value_error() -> None:
+    with pytest.raises(ValueError, match="Unknown vector tool"):
+        run_vector_tool("nonsense", SQUARE)
+
+
+def test_oversized_input_raises_too_large(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(vector_ops, "MAX_FEATURES", 2)
+    big = {"type": "FeatureCollection", "features": [{}, {}, {}]}
+    with pytest.raises(VectorInputTooLarge):
+        run_vector_tool("buffer", big)
+    # It is a ValueError subclass so generic callers still catch it.
+    assert issubclass(VectorInputTooLarge, ValueError)
+
+
+@requires_geopandas
+def test_buffer_returns_feature_collection_and_messages() -> None:
+    geojson, messages = run_vector_tool(
+        "buffer", SQUARE, parameters={"distance": 1, "units": "kilometers"}
+    )
+    assert geojson["type"] == "FeatureCollection"
+    assert len(geojson["features"]) == 1
+    assert messages and "Buffered" in messages[0]
+
+
+@requires_geopandas
+def test_buffer_antimeridian_crossing_raises_value_error() -> None:
+    with pytest.raises(ValueError, match="crosses the antimeridian"):
+        run_vector_tool("buffer", ANTIMERIDIAN_LAYER, parameters={"distance": 1})
+
+
+def _polygon_area(geojson: dict) -> float:
+    """Planar area of a one-feature polygon FeatureCollection, in square degrees.
+
+    Degrees are fine here: the assertions only compare the buffer sides against
+    the same unbuffered square, so the units cancel out.
+    """
+    gpd = pytest.importorskip("geopandas")
+    return float(gpd.GeoDataFrame.from_features(geojson["features"]).geometry.area.sum())
+
+
+@requires_geopandas
+def test_buffer_inside_shrinks_the_polygon() -> None:
+    # GeoLibre#2235: the buffer only ever grew a feature; `side` picks the
+    # direction, and `inside` must erode the polygon rather than grow it.
+    outward, _ = run_vector_tool("buffer", SQUARE, parameters={"distance": 10})
+    inward, messages = run_vector_tool(
+        "buffer", SQUARE, parameters={"distance": 10, "side": "inside"}
+    )
+    assert len(inward["features"]) == 1
+    assert _polygon_area(inward) < _polygon_area(SQUARE) < _polygon_area(outward)
+    assert "(inside)" in messages[0]
+
+
+@requires_geopandas
+def test_buffer_both_keeps_a_band_with_a_hole() -> None:
+    both, _ = run_vector_tool("buffer", SQUARE, parameters={"distance": 10, "side": "both"})
+    assert len(both["features"]) == 1
+    rings = both["features"][0]["geometry"]["coordinates"]
+    # An outer ring plus the hole left where the inward buffer was cut out.
+    assert len(rings) == 2
+    # The band is thinner than either solid it was cut from.
+    assert _polygon_area(both) < _polygon_area(SQUARE)
+    assert both["features"][0]["properties"]["name"] == "a"
+
+
+@requires_geopandas
+def test_buffer_inside_drops_features_it_empties() -> None:
+    # A point has no interior, so the inward buffer empties it. The result must
+    # be an empty layer, not a feature carrying a ring-less polygon.
+    geojson, messages = run_vector_tool(
+        "buffer", POINT_IN_SQUARE, parameters={"distance": 1, "side": "inside"}
+    )
+    assert geojson["features"] == []
+    assert any("Dropped 1 feature(s)" in message for message in messages)
+
+
+@requires_geopandas
+def test_buffer_rejects_unknown_side() -> None:
+    with pytest.raises(ValueError, match="Unknown buffer side"):
+        run_vector_tool("buffer", SQUARE, parameters={"distance": 1, "side": "sideways"})
+
+
+@requires_geopandas
+def test_buffer_rejects_empty_side() -> None:
+    # An explicitly blank side is rejected rather than silently growing, the way
+    # a blank `units` reaches the unit lookup and is rejected there. Only an
+    # absent `side` defaults to "outside". The client engine matches.
+    with pytest.raises(ValueError, match="Unknown buffer side"):
+        run_vector_tool("buffer", SQUARE, parameters={"distance": 1, "side": ""})
+
+
+@requires_geopandas
+def test_buffer_defaults_to_outside_when_side_is_absent() -> None:
+    _, messages = run_vector_tool("buffer", SQUARE, parameters={"distance": 1})
+    assert "(outside)" in messages[0]
+
+
+@requires_geopandas
+def test_buffer_reports_unknown_side_before_negative_distance() -> None:
+    # The client engine validates in this same order (units, side, distance
+    # finiteness, distance sign), so a call with several bad parameters at once
+    # gets the same *first* error from both engines.
+    with pytest.raises(ValueError, match="Unknown buffer side"):
+        run_vector_tool("buffer", SQUARE, parameters={"distance": -5, "side": "bogus"})
+
+
+@requires_geopandas
+def test_buffer_reports_unknown_unit_before_unknown_side() -> None:
+    with pytest.raises(ValueError, match="Unknown unit"):
+        run_vector_tool(
+            "buffer", SQUARE, parameters={"distance": 1, "units": "furlongs", "side": "bogus"}
+        )
+
+
+@requires_geopandas
+def test_buffer_reports_unknown_unit_before_unparseable_distance() -> None:
+    # The distance is parsed only after `units`/`side`, so an unparseable one
+    # cannot pre-empt either check. Before that ordering, `float("abc")` raised
+    # first and neither check was reached.
+    with pytest.raises(ValueError, match="Unknown unit"):
+        run_vector_tool("buffer", SQUARE, parameters={"distance": "abc", "units": "furlongs"})
+
+
+@requires_geopandas
+def test_buffer_reports_unknown_side_before_unparseable_distance() -> None:
+    with pytest.raises(ValueError, match="Unknown buffer side"):
+        run_vector_tool("buffer", SQUARE, parameters={"distance": "abc", "side": "bogus"})
+
+
+@requires_geopandas
+@pytest.mark.parametrize("distance", [True, False, [5], [], {}])
+def test_buffer_rejects_a_non_numeric_distance_type(distance: object) -> None:
+    # `or 0` reads every falsy value as 0 and `float` raises on a non-empty
+    # list, where JavaScript coerces the same values to 0/1/5. Rejecting the
+    # type is the only reading both engines share; the client matches.
+    with pytest.raises(ValueError, match="Buffer distance must be a finite number"):
+        run_vector_tool("buffer", SQUARE, parameters={"distance": distance})
+
+
+@requires_geopandas
+@pytest.mark.parametrize("field", ["units", "side", "distance"])
+def test_buffer_reads_an_explicit_null_as_the_default(field: str) -> None:
+    # An absent parameter and an explicit JSON null take the same default, for
+    # every field. Before this, `units: None` reached the lookup as the unit
+    # "None" and `distance: None` was rejected, while the client defaulted both.
+    parameters: dict[str, object] = {"distance": 1, field: None}
+    _, messages = run_vector_tool("buffer", SQUARE, parameters=parameters)
+    assert messages[0] == "Buffered 1 feature(s) by 1.0 kilometers (outside)"
+
+
+@requires_geopandas
+def test_buffer_reads_an_empty_string_distance_as_zero() -> None:
+    # The one non-number both engines agree on: `"" or 0` is 0 here, and
+    # `Number("")` is 0 on the client.
+    _, messages = run_vector_tool("buffer", SQUARE, parameters={"distance": ""})
+    assert "by 0.0 kilometers" in messages[0]
+
+
+@requires_geopandas
+@pytest.mark.parametrize("distance", ["abc", "0x10", "   "])
+def test_buffer_rejects_unparseable_distance_with_the_tools_own_message(distance: str) -> None:
+    # Not `float`'s raw "could not convert string to float: 'abc'" — the client
+    # engine logs "buffer distance must be a finite number" for the same inputs.
+    with pytest.raises(ValueError, match="Buffer distance must be a finite number"):
+        run_vector_tool("buffer", SQUARE, parameters={"distance": distance})
+
+
+@requires_geopandas
+@pytest.mark.parametrize("distance", [float("nan"), float("inf"), float("-inf")])
+def test_buffer_rejects_non_finite_distance(distance: float) -> None:
+    # `json.loads` accepts NaN/Infinity, so a raw payload can carry one, and NaN
+    # compares False against the >= 0 bound rather than tripping it.
+    with pytest.raises(ValueError, match="finite number"):
+        run_vector_tool("buffer", SQUARE, parameters={"distance": distance})
+
+
+# --- buffer dissolve ---------------------------------------------------------
+#
+# The client engine's half of the same contract lives in
+# tests/vector-buffer-dissolve.test.ts, and the two are kept in step by hand:
+# overlapping buffers merge into one attribute-less polygon, disjoint ones into
+# a single multipolygon, and a non-boolean flag is rejected on both sides. A
+# change to either file needs its counterpart.
+
+TWO_SQUARES = {
+    "type": "FeatureCollection",
+    "features": [*SQUARE["features"], *OVERLAP["features"]],
+}
+FAR_APART_SQUARES = {
+    "type": "FeatureCollection",
+    "features": [*SQUARE["features"], *DISJOINT["features"]],
+}
+
+
+@requires_geopandas
+def test_buffer_dissolve_merges_overlapping_buffers() -> None:
+    geojson, messages = run_vector_tool(
+        "buffer", TWO_SQUARES, parameters={"distance": 1, "dissolve": True}
+    )
+    assert len(geojson["features"]) == 1
+    assert geojson["features"][0]["geometry"]["type"] == "Polygon"
+    # The merged ring belongs to no single input feature, so it carries no
+    # attributes — the client engine's union drops them the same way.
+    assert geojson["features"][0]["properties"] == {}
+    assert messages == [
+        "Buffered 2 feature(s) by 1.0 kilometers (outside)",
+        "Dissolved 2 buffer(s) into 1 feature",
+    ]
+
+
+@requires_geopandas
+def test_buffer_dissolve_keeps_disjoint_buffers_as_one_multipolygon() -> None:
+    geojson, _ = run_vector_tool(
+        "buffer", FAR_APART_SQUARES, parameters={"distance": 1, "dissolve": True}
+    )
+    assert len(geojson["features"]) == 1
+    assert geojson["features"][0]["geometry"]["type"] == "MultiPolygon"
+    assert len(geojson["features"][0]["geometry"]["coordinates"]) == 2
+
+
+@requires_geopandas
+def test_buffer_without_dissolve_keeps_one_buffer_per_feature() -> None:
+    geojson, messages = run_vector_tool(
+        "buffer", TWO_SQUARES, parameters={"distance": 1, "dissolve": False}
+    )
+    assert len(geojson["features"]) == 2
+    assert geojson["features"][0]["properties"]["name"] == "a"
+    assert not any("Dissolved" in message for message in messages)
+
+
+@requires_geopandas
+def test_buffer_dissolve_is_silent_when_nothing_survived() -> None:
+    # Nothing to merge, so the run produces the same empty layer it would
+    # without the flag rather than an "Unable to dissolve" error.
+    geojson, messages = run_vector_tool(
+        "buffer",
+        POINT_IN_SQUARE,
+        parameters={"distance": 1, "side": "inside", "dissolve": True},
+    )
+    assert geojson["features"] == []
+    assert not any("Dissolved" in message for message in messages)
+
+
+@requires_geopandas
+@pytest.mark.parametrize(
+    ("raw", "dissolved"),
+    [
+        (True, True),
+        (False, False),
+        (None, False),
+        ("true", True),
+        ("false", False),
+        ("  On  ", True),
+        ("1", True),
+        ("0", False),
+        ("", False),
+        (1, True),
+        (0, False),
+    ],
+)
+def test_buffer_dissolve_reads_the_same_words_as_the_client(raw: object, dissolved: bool) -> None:
+    # A checkbox that round-tripped through a query string, a CSV batch row, or
+    # a replayed history entry arrives as a string; `booleanParam` on the client
+    # reads this same set.
+    geojson, _ = run_vector_tool("buffer", TWO_SQUARES, parameters={"distance": 1, "dissolve": raw})
+    assert len(geojson["features"]) == (1 if dissolved else 2)
+
+
+@requires_geopandas
+@pytest.mark.parametrize("raw", ["maybe", "flase", [True], {}, float("nan")])
+def test_buffer_rejects_a_non_boolean_dissolve(raw: object) -> None:
+    # Each language's own truthiness reads these differently (`bool([])` is
+    # False where `Boolean([])` is true), so rejecting is the only shared read.
+    with pytest.raises(ValueError, match="Buffer dissolve must be true or false"):
+        run_vector_tool("buffer", TWO_SQUARES, parameters={"distance": 1, "dissolve": raw})
+
+
+@requires_geopandas
+def test_buffer_dissolve_reports_a_geos_failure_as_bad_input(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A GEOS TopologyException must surface as a ValueError (HTTP 400), not as
+    # an unhandled 500 — the client engine answers the same failure by logging
+    # "unable to dissolve" and producing no result layer.
+    import geopandas as gpd
+
+    def boom(self: object, *args: object, **kwargs: object) -> NoReturn:
+        raise RuntimeError("TopologyException: found non-noded intersection")
+
+    monkeypatch.setattr(gpd.GeoSeries, "union_all", boom)
+    with pytest.raises(ValueError, match="Unable to dissolve the buffered features"):
+        run_vector_tool("buffer", TWO_SQUARES, parameters={"distance": 1, "dissolve": True})
+
+
+@requires_geopandas
+def test_buffer_dissolve_rejects_a_union_that_came_back_empty(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # An empty geometry serializes to a ring-less polygon no renderer can draw,
+    # the same shape the per-feature `is_empty` filter above exists to drop.
+    import geopandas as gpd
+    from shapely.geometry import Polygon
+
+    monkeypatch.setattr(gpd.GeoSeries, "union_all", lambda self, *a, **k: Polygon())
+    with pytest.raises(ValueError, match="Unable to dissolve the buffered features"):
+        run_vector_tool("buffer", TWO_SQUARES, parameters={"distance": 1, "dissolve": True})
+
+
+@requires_geopandas
+@pytest.mark.parametrize(
+    ("field", "message"),
+    [
+        ("dissolve", "Buffer dissolve must be true or false"),
+        ("distance", "Buffer distance must be a finite number"),
+    ],
+)
+def test_buffer_rejects_an_integer_too_large_for_a_float(field: str, message: str) -> None:
+    # `json.loads` keeps an arbitrarily large integer exact, so a raw payload can
+    # carry one; `math.isfinite`/`float` raise OverflowError converting it. The
+    # same literal reaches the client as `Infinity`, which it rejects, so both
+    # engines must answer with the tool's own message rather than a 500.
+    parameters: dict[str, object] = {"distance": 1, field: 10**309}
+    with pytest.raises(ValueError, match=message):
+        run_vector_tool("buffer", SQUARE, parameters=parameters)
+
+
+@requires_geopandas
+def test_buffer_reports_a_bad_dissolve_before_a_bad_distance() -> None:
+    # units, then side, then dissolve, then the distance — the client engine
+    # validates in this same order.
+    with pytest.raises(ValueError, match="Buffer dissolve must be true or false"):
+        run_vector_tool("buffer", SQUARE, parameters={"distance": -5, "dissolve": "maybe"})
+
+
+@requires_geopandas
+def test_buffer_reports_an_unknown_side_before_a_bad_dissolve() -> None:
+    with pytest.raises(ValueError, match="Unknown buffer side"):
+        run_vector_tool(
+            "buffer", SQUARE, parameters={"distance": 1, "side": "bogus", "dissolve": "maybe"}
+        )
+
+
+@requires_geopandas
+def test_centroids_exercises_pyproj_utm_path() -> None:
+    # centroids/buffer call estimate_utm_crs(), which needs pyproj's PROJ data;
+    # this guards that path that the Pyodide engine also relies on.
+    geojson, _ = run_vector_tool("centroids", SQUARE)
+    assert geojson["type"] == "FeatureCollection"
+    assert geojson["features"][0]["geometry"]["type"] == "Point"
+
+
+@requires_geopandas
+def test_centroids_antimeridian_crossing_raises_value_error() -> None:
+    with pytest.raises(ValueError, match="crosses the antimeridian"):
+        run_vector_tool("centroids", ANTIMERIDIAN_LAYER)
+
+
+@requires_geopandas
+@pytest.mark.parametrize("tool_id", ["clip", "intersection", "difference", "union"])
+def test_overlay_tools(tool_id: str) -> None:
+    geojson, _ = run_vector_tool(tool_id, SQUARE, OVERLAP)
+    assert geojson["type"] == "FeatureCollection"
+    assert len(geojson["features"]) >= 1
+
+
+@requires_geopandas
+def test_spatial_join_attaches_join_attributes() -> None:
+    geojson, messages = run_vector_tool(
+        "spatial-join",
+        SQUARE,
+        OVERLAP,
+        parameters={"predicate": "intersects", "how": "inner"},
+    )
+    assert geojson["type"] == "FeatureCollection"
+    assert len(geojson["features"]) == 1
+    props = geojson["features"][0]["properties"]
+    # Both layers carry a "name" column, so gpd.sjoin suffixes the collision.
+    assert props.get("name_left") == "a"
+    assert props.get("name_right") == "b"
+    assert "index_right" not in props
+    assert messages and "Spatial join" in messages[0]
+
+
+@requires_geopandas
+def test_spatial_join_left_keeps_unmatched_input() -> None:
+    geojson, _ = run_vector_tool("spatial-join", SQUARE, DISJOINT, parameters={"how": "left"})
+    assert len(geojson["features"]) == 1
+
+
+@requires_geopandas
+def test_spatial_join_inner_drops_unmatched_input() -> None:
+    geojson, _ = run_vector_tool("spatial-join", SQUARE, DISJOINT, parameters={"how": "inner"})
+    assert geojson["features"] == []
+
+
+@requires_geopandas
+def test_spatial_join_empty_join_layer_left_keeps_input() -> None:
+    geojson, _ = run_vector_tool("spatial-join", SQUARE, EMPTY, parameters={"how": "left"})
+    assert len(geojson["features"]) == 1
+
+
+@requires_geopandas
+def test_spatial_join_empty_join_layer_inner_is_empty() -> None:
+    geojson, _ = run_vector_tool("spatial-join", SQUARE, EMPTY, parameters={"how": "inner"})
+    assert geojson["features"] == []
+
+
+@requires_geopandas
+def test_spatial_join_within_predicate_matches() -> None:
+    # The point lies within the square, so a within-join (point -> square) matches.
+    geojson, _ = run_vector_tool(
+        "spatial-join", POINT_IN_SQUARE, SQUARE, parameters={"predicate": "within"}
+    )
+    assert len(geojson["features"]) == 1
+    assert geojson["features"][0]["properties"].get("name_right") == "a"
+
+
+@requires_geopandas
+def test_spatial_join_contains_predicate_matches() -> None:
+    # The square contains the point, so a contains-join (square -> point) matches.
+    geojson, _ = run_vector_tool(
+        "spatial-join", SQUARE, POINT_IN_SQUARE, parameters={"predicate": "contains"}
+    )
+    assert len(geojson["features"]) == 1
+    assert geojson["features"][0]["properties"].get("name_left") == "a"
+
+
+@requires_geopandas
+def test_spatial_join_invalid_predicate_raises_value_error() -> None:
+    with pytest.raises(ValueError, match="predicate"):
+        run_vector_tool("spatial-join", SQUARE, OVERLAP, parameters={"predicate": "bogus"})
+
+
+@requires_geopandas
+def test_spatial_join_invalid_how_raises_value_error() -> None:
+    with pytest.raises(ValueError, match="join type"):
+        run_vector_tool("spatial-join", SQUARE, OVERLAP, parameters={"how": "outer"})
+
+
+# --- Select by value (pure attribute filter; no GeoPandas required) ---
+
+
+def test_select_by_value_numeric_comparison() -> None:
+    geojson, messages = run_vector_tool(
+        "select-by-value",
+        ATTR_LAYER,
+        parameters={"field": "pop", "operator": "gt", "value": "15"},
+    )
+    names = [f["properties"]["name"] for f in geojson["features"]]
+    assert names == ["beta"]
+    assert messages and "1 of 4" in messages[0]
+
+
+def test_select_by_value_string_equals() -> None:
+    geojson, _ = run_vector_tool(
+        "select-by-value",
+        ATTR_LAYER,
+        parameters={"field": "name", "operator": "eq", "value": "alpha"},
+    )
+    assert [f["properties"]["name"] for f in geojson["features"]] == ["alpha"]
+
+
+def test_select_by_value_contains_is_case_insensitive() -> None:
+    geojson, _ = run_vector_tool(
+        "select-by-value",
+        ATTR_LAYER,
+        parameters={"field": "name", "operator": "contains", "value": "ET"},
+    )
+    assert [f["properties"]["name"] for f in geojson["features"]] == ["beta"]
+
+
+def test_select_by_value_is_null_matches_null_and_missing() -> None:
+    # gamma has pop=None and delta omits the key entirely; both are "empty".
+    geojson, _ = run_vector_tool(
+        "select-by-value",
+        ATTR_LAYER,
+        parameters={"field": "pop", "operator": "is-null"},
+    )
+    names = sorted(f["properties"]["name"] for f in geojson["features"])
+    assert names == ["delta", "gamma"]
+
+
+def test_select_by_value_is_null_matches_empty_string() -> None:
+    layer = {
+        "type": "FeatureCollection",
+        "features": [_attr_point("", 1, 0.0), _attr_point("named", 1, 1.0)],
+    }
+    geojson, _ = run_vector_tool(
+        "select-by-value", layer, parameters={"field": "name", "operator": "is-null"}
+    )
+    assert [f["properties"]["name"] for f in geojson["features"]] == [""]
+
+
+def test_select_by_value_neq_excludes_null_and_missing() -> None:
+    # SQL-like: neq does not match null (gamma) or missing (delta) values.
+    geojson, _ = run_vector_tool(
+        "select-by-value",
+        ATTR_LAYER,
+        parameters={"field": "pop", "operator": "neq", "value": "10"},
+    )
+    assert sorted(f["properties"]["name"] for f in geojson["features"]) == ["beta"]
+
+
+def test_select_by_value_is_not_null_matches_real_values() -> None:
+    geojson, _ = run_vector_tool(
+        "select-by-value",
+        ATTR_LAYER,
+        parameters={"field": "pop", "operator": "is-not-null"},
+    )
+    names = sorted(f["properties"]["name"] for f in geojson["features"])
+    assert names == ["alpha", "beta"]
+
+
+@pytest.mark.parametrize(
+    ("operator", "value", "expected"),
+    [
+        ("neq", "alpha", ["beta", "delta", "gamma"]),
+        ("starts-with", "AL", ["alpha"]),
+        ("gte", "20", ["beta"]),
+        ("lt", "20", ["alpha"]),
+        ("lte", "10", ["alpha"]),
+    ],
+)
+def test_select_by_value_operators(operator, value, expected) -> None:
+    field = "name" if operator in ("neq", "starts-with") else "pop"
+    geojson, _ = run_vector_tool(
+        "select-by-value",
+        ATTR_LAYER,
+        parameters={"field": field, "operator": operator, "value": value},
+    )
+    assert sorted(f["properties"]["name"] for f in geojson["features"]) == expected
+
+
+def test_select_by_value_hexlike_string_compared_as_text() -> None:
+    # "0x10" must not be coerced to 16 (Python float() rejects it); the client
+    # engine matches via parseFiniteNumber, so both compare it as text.
+    layer = {
+        "type": "FeatureCollection",
+        "features": [
+            {
+                "type": "Feature",
+                "properties": {"code": "0x10"},
+                "geometry": {"type": "Point", "coordinates": [0.0, 0.0]},
+            }
+        ],
+    }
+    miss, _ = run_vector_tool(
+        "select-by-value",
+        layer,
+        parameters={"field": "code", "operator": "eq", "value": "16"},
+    )
+    assert miss["features"] == []
+    hit, _ = run_vector_tool(
+        "select-by-value",
+        layer,
+        parameters={"field": "code", "operator": "eq", "value": "0x10"},
+    )
+    assert len(hit["features"]) == 1
+
+
+def test_select_by_value_unknown_operator_raises() -> None:
+    with pytest.raises(ValueError, match="operator"):
+        run_vector_tool(
+            "select-by-value",
+            ATTR_LAYER,
+            parameters={"field": "pop", "operator": "bogus", "value": "1"},
+        )
+
+
+def test_select_by_value_absent_field_runs_schemaless() -> None:
+    # A field absent from every feature is all-empty, not an error: eq matches
+    # nothing while is-null matches every feature.
+    none_geojson, _ = run_vector_tool(
+        "select-by-value",
+        ATTR_LAYER,
+        parameters={"field": "missing", "operator": "eq", "value": "x"},
+    )
+    assert none_geojson["features"] == []
+    all_geojson, _ = run_vector_tool(
+        "select-by-value",
+        ATTR_LAYER,
+        parameters={"field": "missing", "operator": "is-null"},
+    )
+    assert len(all_geojson["features"]) == len(ATTR_LAYER["features"])
+
+
+def test_select_by_value_missing_value_raises() -> None:
+    with pytest.raises(ValueError, match="value is required"):
+        run_vector_tool(
+            "select-by-value", ATTR_LAYER, parameters={"field": "pop", "operator": "eq"}
+        )
+
+
+# --- Attribute join (no GeoPandas; pure attribute merge) ---
+
+
+def _attr_join_feature(props: dict, x: float = 0.0) -> dict:
+    return {
+        "type": "Feature",
+        "properties": props,
+        "geometry": {"type": "Point", "coordinates": [x, x]},
+    }
+
+
+# Counties keyed by GEOID; "1003" is stored as a number to exercise the
+# string/number key coercion, and "09999" has no matching stats row.
+JOIN_COUNTIES = {
+    "type": "FeatureCollection",
+    "features": [
+        _attr_join_feature({"GEOID": "01001"}, 0.0),
+        _attr_join_feature({"GEOID": 1003}, 1.0),
+        _attr_join_feature({"GEOID": "09999"}, 2.0),
+    ],
+}
+# Stats table: two rows share key "1003" (first wins); geometry is ignored.
+JOIN_STATS = {
+    "type": "FeatureCollection",
+    "features": [
+        _attr_join_feature({"code": "01001", "pop": 100, "label": "Autauga"}),
+        _attr_join_feature({"code": "1003", "pop": 200, "label": "Barbour"}),
+        _attr_join_feature({"code": "1003", "pop": 999, "label": "DUPLICATE"}),
+    ],
+}
+
+
+def test_attribute_join_left_keeps_all_and_null_fills_unmatched() -> None:
+    geojson, messages = run_vector_tool(
+        "attribute-join",
+        JOIN_COUNTIES,
+        JOIN_STATS,
+        parameters={"target_field": "GEOID", "join_field": "code", "how": "left"},
+    )
+    features = geojson["features"]
+    assert len(features) == 3
+    by_geoid = {f["properties"]["GEOID"]: f["properties"] for f in features}
+    assert by_geoid["01001"]["pop"] == 100
+    assert by_geoid["01001"]["label"] == "Autauga"
+    # Numeric key 1003 matches the string "1003"; the first duplicate row wins.
+    assert by_geoid[1003]["pop"] == 200
+    assert by_geoid[1003]["label"] == "Barbour"
+    # The default field set excludes the join key, so "code" is not copied over.
+    assert "code" not in by_geoid[1003]
+    # Unmatched row null-fills the brought-over columns (consistent schema).
+    assert by_geoid["09999"]["pop"] is None
+    assert by_geoid["09999"]["label"] is None
+    assert messages and "2 of 3 feature(s) matched" in messages[-1]
+
+
+def test_attribute_join_inner_drops_unmatched_and_honours_field_list() -> None:
+    geojson, _ = run_vector_tool(
+        "attribute-join",
+        JOIN_COUNTIES,
+        JOIN_STATS,
+        parameters={
+            "target_field": "GEOID",
+            "join_field": "code",
+            "how": "inner",
+            "fields": "pop",
+        },
+    )
+    features = geojson["features"]
+    assert len(features) == 2
+    barbour = next(f for f in features if f["properties"]["GEOID"] == 1003)
+    assert barbour["properties"]["pop"] == 200
+    # Only "pop" was requested, so "label" is not brought over.
+    assert "label" not in barbour["properties"]
+
+
+def test_attribute_join_empty_join_layer_left_keeps_input_unchanged() -> None:
+    geojson, _ = run_vector_tool(
+        "attribute-join",
+        JOIN_COUNTIES,
+        EMPTY,
+        parameters={"target_field": "GEOID", "join_field": "code", "how": "left"},
+    )
+    assert len(geojson["features"]) == len(JOIN_COUNTIES["features"])
+
+
+def test_attribute_join_empty_join_layer_inner_is_empty() -> None:
+    geojson, _ = run_vector_tool(
+        "attribute-join",
+        JOIN_COUNTIES,
+        EMPTY,
+        parameters={"target_field": "GEOID", "join_field": "code", "how": "inner"},
+    )
+    assert geojson["features"] == []
+
+
+def test_attribute_join_unknown_how_raises() -> None:
+    with pytest.raises(ValueError, match="Unknown join type"):
+        run_vector_tool(
+            "attribute-join",
+            JOIN_COUNTIES,
+            JOIN_STATS,
+            parameters={
+                "target_field": "GEOID",
+                "join_field": "code",
+                "how": "outer",
+            },
+        )
+
+
+def test_attribute_join_blank_fields_string_brings_over_all() -> None:
+    # A fields string that is only separators (e.g. ",") is treated as blank,
+    # falling back to the default (every join field except the key) rather than
+    # erroring with "none of the requested join fields".
+    geojson, _ = run_vector_tool(
+        "attribute-join",
+        JOIN_COUNTIES,
+        JOIN_STATS,
+        parameters={
+            "target_field": "GEOID",
+            "join_field": "code",
+            "how": "left",
+            "fields": " , ",
+        },
+    )
+    autauga = next(f for f in geojson["features"] if f["properties"]["GEOID"] == "01001")
+    assert autauga["properties"]["pop"] == 100
+    assert autauga["properties"]["label"] == "Autauga"
+
+
+def test_attribute_join_missing_requested_fields_raises() -> None:
+    with pytest.raises(ValueError, match="None of the requested join fields"):
+        run_vector_tool(
+            "attribute-join",
+            JOIN_COUNTIES,
+            JOIN_STATS,
+            parameters={
+                "target_field": "GEOID",
+                "join_field": "code",
+                "fields": "nonexistent",
+            },
+        )
+
+
+# --- Select by location ---
+
+
+@requires_geopandas
+def test_select_by_location_intersects() -> None:
+    geojson, messages = run_vector_tool(
+        "select-by-location", SQUARE, OVERLAP, parameters={"predicate": "intersects"}
+    )
+    assert len(geojson["features"]) == 1
+    assert messages and "1 of 1" in messages[0]
+
+
+@requires_geopandas
+def test_select_by_location_within_and_contains() -> None:
+    big = {
+        "type": "FeatureCollection",
+        "features": [
+            {
+                "type": "Feature",
+                "properties": {"name": "big"},
+                "geometry": {
+                    "type": "Polygon",
+                    "coordinates": [[[-5, -5], [-5, 5], [5, 5], [5, -5], [-5, -5]]],
+                },
+            }
+        ],
+    }
+    # SQUARE (0..1) is within big; big is not within SQUARE.
+    within, _ = run_vector_tool(
+        "select-by-location", SQUARE, big, parameters={"predicate": "within"}
+    )
+    assert len(within["features"]) == 1
+    none, _ = run_vector_tool("select-by-location", big, SQUARE, parameters={"predicate": "within"})
+    assert none["features"] == []
+    # big contains SQUARE.
+    contains, _ = run_vector_tool(
+        "select-by-location", big, SQUARE, parameters={"predicate": "contains"}
+    )
+    assert len(contains["features"]) == 1
+
+
+@requires_geopandas
+def test_select_by_location_empty_filter_intersects_selects_none() -> None:
+    geojson, _ = run_vector_tool(
+        "select-by-location", SQUARE, EMPTY, parameters={"predicate": "intersects"}
+    )
+    assert geojson["features"] == []
+
+
+@requires_geopandas
+def test_select_by_location_disjoint_selects_non_overlapping() -> None:
+    geojson, _ = run_vector_tool(
+        "select-by-location", SQUARE, DISJOINT, parameters={"predicate": "disjoint"}
+    )
+    assert len(geojson["features"]) == 1
+
+
+@requires_geopandas
+def test_select_by_location_intersects_disjoint_layer_selects_none() -> None:
+    geojson, _ = run_vector_tool(
+        "select-by-location", SQUARE, DISJOINT, parameters={"predicate": "intersects"}
+    )
+    assert geojson["features"] == []
+
+
+@requires_geopandas
+def test_select_by_location_empty_filter_disjoint_keeps_all() -> None:
+    geojson, _ = run_vector_tool(
+        "select-by-location", SQUARE, EMPTY, parameters={"predicate": "disjoint"}
+    )
+    assert len(geojson["features"]) == 1
+
+
+@requires_geopandas
+def test_select_by_location_unknown_predicate_raises() -> None:
+    with pytest.raises(ValueError, match="predicate"):
+        run_vector_tool("select-by-location", SQUARE, OVERLAP, parameters={"predicate": "bogus"})
+
+
+@requires_geopandas
+def test_dissolve_unknown_field_raises_value_error() -> None:
+    with pytest.raises(ValueError, match="not found"):
+        run_vector_tool("dissolve", SQUARE, parameters={"field": "missing"})
+
+
+# --- Reproject ---
+
+
+@requires_geopandas
+def test_reproject_web_mercator_to_wgs84() -> None:
+    # A point at the eastern edge of Web Mercator (x ≈ 20037508.34) maps to
+    # lon ≈ 180, lat ≈ 0 once reinterpreted as EPSG:3857 and sent to WGS84.
+    mercator_point = {
+        "type": "FeatureCollection",
+        "features": [
+            {
+                "type": "Feature",
+                "properties": {"name": "edge"},
+                "geometry": {
+                    "type": "Point",
+                    "coordinates": [20037508.342789244, 0.0],
+                },
+            }
+        ],
+    }
+    geojson, messages = run_vector_tool(
+        "reproject", mercator_point, parameters={"source_crs": "EPSG:3857"}
+    )
+    lon, lat = geojson["features"][0]["geometry"]["coordinates"]
+    assert abs(lon - 180.0) < 1e-6
+    assert abs(lat) < 1e-6
+    assert messages and "Reprojected" in messages[0]
+
+
+@requires_geopandas
+def test_reproject_missing_source_crs_raises() -> None:
+    with pytest.raises(ValueError, match="source CRS is required"):
+        run_vector_tool("reproject", SQUARE, parameters={})
+
+
+@requires_geopandas
+def test_reproject_invalid_source_crs_raises() -> None:
+    with pytest.raises(ValueError, match="Invalid source CRS"):
+        run_vector_tool("reproject", SQUARE, parameters={"source_crs": "EPSG:bogus"})
+
+
+# --- Explode ---
+
+
+@requires_geopandas
+def test_explode_splits_multipart_into_singlepart() -> None:
+    multipolygon = {
+        "type": "FeatureCollection",
+        "features": [
+            {
+                "type": "Feature",
+                "properties": {"name": "mp"},
+                "geometry": {
+                    "type": "MultiPolygon",
+                    "coordinates": [
+                        [[[0, 0], [0, 1], [1, 1], [1, 0], [0, 0]]],
+                        [[[2, 2], [2, 3], [3, 3], [3, 2], [2, 2]]],
+                    ],
+                },
+            }
+        ],
+    }
+    geojson, messages = run_vector_tool("explode", multipolygon)
+    assert len(geojson["features"]) == 2
+    assert all(f["geometry"]["type"] == "Polygon" for f in geojson["features"])
+    # Each part keeps the parent's attributes.
+    assert all(f["properties"]["name"] == "mp" for f in geojson["features"])
+    assert messages and "single-part" in messages[0]
+
+
+# --- Aggregate by attribute ---
+
+
+def _parcels() -> dict:
+    def cell(region: str, pop: int, x: float) -> dict:
+        return {
+            "type": "Feature",
+            "properties": {"region": region, "pop": pop},
+            "geometry": {
+                "type": "Polygon",
+                "coordinates": [[[x, 0], [x, 1], [x + 1, 1], [x + 1, 0], [x, 0]]],
+            },
+        }
+
+    return {
+        "type": "FeatureCollection",
+        "features": [cell("north", 10, 0), cell("north", 30, 1), cell("south", 5, 5)],
+    }
+
+
+@requires_geopandas
+def test_aggregate_count_per_group() -> None:
+    geojson, messages = run_vector_tool(
+        "aggregate",
+        _parcels(),
+        parameters={"group_field": "region", "statistic": "count"},
+    )
+    by_region = {f["properties"]["region"]: f["properties"] for f in geojson["features"]}
+    assert by_region["north"]["count"] == 2
+    assert by_region["south"]["count"] == 1
+    assert messages and "Aggregated" in messages[0]
+
+
+@requires_geopandas
+def test_aggregate_sum_names_column_field_stat() -> None:
+    geojson, _ = run_vector_tool(
+        "aggregate",
+        _parcels(),
+        parameters={"group_field": "region", "statistic": "sum", "stat_field": "pop"},
+    )
+    by_region = {f["properties"]["region"]: f["properties"] for f in geojson["features"]}
+    assert by_region["north"]["pop_sum"] == 40
+    assert by_region["south"]["pop_sum"] == 5
+
+
+@requires_geopandas
+def test_aggregate_requires_stat_field_for_non_count() -> None:
+    with pytest.raises(ValueError, match="statistic field is required"):
+        run_vector_tool(
+            "aggregate",
+            _parcels(),
+            parameters={"group_field": "region", "statistic": "sum"},
+        )
+
+
+@requires_geopandas
+def test_aggregate_unknown_group_field_raises() -> None:
+    with pytest.raises(ValueError, match="Group field"):
+        run_vector_tool(
+            "aggregate",
+            _parcels(),
+            parameters={"group_field": "missing", "statistic": "count"},
+        )
+
+
+@requires_geopandas
+def test_aggregate_counts_polygons_only_for_mixed_geometry() -> None:
+    # A mixed layer (2 polygons + 1 point, all group "a") must count only the
+    # polygons, matching the client engine's polygon-only restriction.
+    poly = {
+        "type": "Feature",
+        "properties": {"region": "a", "pop": 10},
+        "geometry": {
+            "type": "Polygon",
+            "coordinates": [[[0, 0], [0, 1], [1, 1], [1, 0], [0, 0]]],
+        },
+    }
+    poly2 = {
+        "type": "Feature",
+        "properties": {"region": "a", "pop": 20},
+        "geometry": {
+            "type": "Polygon",
+            "coordinates": [[[1, 0], [1, 1], [2, 1], [2, 0], [1, 0]]],
+        },
+    }
+    point = {
+        "type": "Feature",
+        "properties": {"region": "a", "pop": 99},
+        "geometry": {"type": "Point", "coordinates": [0.5, 0.5]},
+    }
+    mixed = {"type": "FeatureCollection", "features": [poly, poly2, point]}
+    geojson, _ = run_vector_tool(
+        "aggregate", mixed, parameters={"group_field": "region", "statistic": "count"}
+    )
+    assert len(geojson["features"]) == 1
+    # Only the 2 polygons count; the point is excluded.
+    assert geojson["features"][0]["properties"]["count"] == 2
+
+
+@requires_geopandas
+def test_aggregate_all_null_group_values_returns_empty_result() -> None:
+    # Polygons exist but every group value is null: pandas groupby(dropna=True)
+    # yields no groups, so the result is empty (not an error), matching the client.
+    all_null = {
+        "type": "FeatureCollection",
+        "features": [
+            {
+                "type": "Feature",
+                "properties": {"region": None, "pop": 1},
+                "geometry": {
+                    "type": "Polygon",
+                    "coordinates": [[[0, 0], [0, 1], [1, 1], [1, 0], [0, 0]]],
+                },
+            },
+            {
+                "type": "Feature",
+                "properties": {"region": None, "pop": 2},
+                "geometry": {
+                    "type": "Polygon",
+                    "coordinates": [[[2, 0], [2, 1], [3, 1], [3, 0], [2, 0]]],
+                },
+            },
+        ],
+    }
+    geojson, messages = run_vector_tool(
+        "aggregate",
+        all_null,
+        parameters={"group_field": "region", "statistic": "count"},
+    )
+    assert geojson["features"] == []
+    assert messages and "0 group(s)" in messages[0]
+
+
+@requires_geopandas
+def test_aggregate_geometry_group_field_raises_clean_error() -> None:
+    # "geometry" is in gdf.columns but grouping by it would raise an unhashable
+    # TypeError (a 500); it must be rejected as a clean "not found" (400) instead.
+    with pytest.raises(ValueError, match="not found"):
+        run_vector_tool(
+            "aggregate",
+            _parcels(),
+            parameters={"group_field": "geometry", "statistic": "count"},
+        )
+
+
+# --- Smooth ---
+
+
+def test_smooth_polygon_chaikin_exact_coordinates() -> None:
+    # Smooth is pure coordinate math (no GeoPandas), so it runs unconditionally
+    # and must match the client engine bit-for-bit on a known case.
+    square = {
+        "type": "FeatureCollection",
+        "features": [
+            {
+                "type": "Feature",
+                "properties": {"name": "s"},
+                "geometry": {
+                    "type": "Polygon",
+                    "coordinates": [
+                        [[0, 0], [0, 10], [10, 10], [10, 0], [0, 0]],
+                    ],
+                },
+            }
+        ],
+    }
+    geojson, messages = run_vector_tool("smooth", square, parameters={"iterations": 1})
+    ring = geojson["features"][0]["geometry"]["coordinates"][0]
+    # One Chaikin pass on the 4-vertex ring -> 8 cut points + the closing vertex.
+    assert len(ring) == 9
+    assert ring[0] == ring[-1]
+    # The first cut point is 1/4 along the first segment ([0,0] -> [0,10]).
+    assert ring[0] == [0, 2.5]
+    assert geojson["features"][0]["geometry"]["type"] == "Polygon"
+    assert geojson["features"][0]["properties"]["name"] == "s"
+    assert messages and "Smoothed 1 feature" in messages[0]
+
+
+def test_smooth_passes_points_through_unchanged() -> None:
+    pts = {
+        "type": "FeatureCollection",
+        "features": [
+            {
+                "type": "Feature",
+                "properties": {},
+                "geometry": {"type": "Point", "coordinates": [1, 2]},
+            }
+        ],
+    }
+    geojson, messages = run_vector_tool("smooth", pts, parameters={"iterations": 3})
+    assert geojson["features"][0]["geometry"] == {"type": "Point", "coordinates": [1, 2]}
+    # No line/polygon features were smoothed.
+    assert messages and "Smoothed 0 feature" in messages[0]
+
+
+def test_smooth_rejects_out_of_range_iterations() -> None:
+    line = {
+        "type": "FeatureCollection",
+        "features": [
+            {
+                "type": "Feature",
+                "properties": {},
+                "geometry": {"type": "LineString", "coordinates": [[0, 0], [1, 1]]},
+            }
+        ],
+    }
+    with pytest.raises(ValueError, match="between 1 and 10"):
+        run_vector_tool("smooth", line, parameters={"iterations": 99})
+
+
+def test_smooth_empty_ring_does_not_crash() -> None:
+    # A malformed polygon with an empty ring must not raise (IndexError -> 500);
+    # the ring stays empty. Mirrors the client guard.
+    malformed = {
+        "type": "FeatureCollection",
+        "features": [
+            {
+                "type": "Feature",
+                "properties": {},
+                "geometry": {"type": "Polygon", "coordinates": [[]]},
+            }
+        ],
+    }
+    geojson, _ = run_vector_tool("smooth", malformed, parameters={"iterations": 2})
+    assert geojson["features"][0]["geometry"]["coordinates"] == [[]]
+
+
+def test_smooth_iterations_round_half_up_matches_js() -> None:
+    # 3.5 rounds up to 4 (JS Math.round semantics), not down to 3 like Python's
+    # banker's round(), keeping the client and Python engines bit-identical.
+    square = {
+        "type": "FeatureCollection",
+        "features": [
+            {
+                "type": "Feature",
+                "properties": {},
+                "geometry": {
+                    "type": "Polygon",
+                    "coordinates": [[[0, 0], [0, 10], [10, 10], [10, 0], [0, 0]]],
+                },
+            }
+        ],
+    }
+    _, messages = run_vector_tool("smooth", square, parameters={"iterations": 3.5})
+    assert messages and "with 4 iteration(s)" in messages[0]
+
+
+def test_smooth_iterations_zero_is_rejected() -> None:
+    # An explicit 0 must hit the range check, not be silently coerced to 3.
+    line = {
+        "type": "FeatureCollection",
+        "features": [
+            {
+                "type": "Feature",
+                "properties": {},
+                "geometry": {"type": "LineString", "coordinates": [[0, 0], [1, 1]]},
+            }
+        ],
+    }
+    with pytest.raises(ValueError, match="between 1 and 10"):
+        run_vector_tool("smooth", line, parameters={"iterations": 0})
+
+
+def test_smooth_boolean_iterations_falls_back_to_default() -> None:
+    # A JSON boolean is not a number on the client (it uses the fallback 3), so
+    # the backend must not treat False as 0 (which would error). Keeps parity.
+    line = {
+        "type": "FeatureCollection",
+        "features": [
+            {
+                "type": "Feature",
+                "properties": {},
+                "geometry": {"type": "LineString", "coordinates": [[0, 0], [1, 1]]},
+            }
+        ],
+    }
+    _, messages = run_vector_tool("smooth", line, parameters={"iterations": False})
+    assert messages and "with 3 iteration(s)" in messages[0]
+
+
+def test_smooth_missing_coordinates_does_not_crash() -> None:
+    # A malformed geometry with no coordinates key must not raise (TypeError ->
+    # 500); the coordinate list is treated as empty.
+    malformed = {
+        "type": "FeatureCollection",
+        "features": [{"type": "Feature", "properties": {}, "geometry": {"type": "LineString"}}],
+    }
+    geojson, _ = run_vector_tool("smooth", malformed, parameters={"iterations": 2})
+    assert geojson["features"][0]["geometry"]["coordinates"] == []
+
+
+def test_smooth_degenerate_ring_collapses_to_empty() -> None:
+    # A 2-vertex (degenerate) ring can't form a valid polygon; it collapses to an
+    # empty ring rather than being re-closed into invalid GeoJSON.
+    degenerate = {
+        "type": "FeatureCollection",
+        "features": [
+            {
+                "type": "Feature",
+                "properties": {},
+                "geometry": {
+                    "type": "Polygon",
+                    "coordinates": [[[0, 0], [1, 1], [0, 0]]],
+                },
+            }
+        ],
+    }
+    geojson, _ = run_vector_tool("smooth", degenerate, parameters={"iterations": 3})
+    assert geojson["features"][0]["geometry"]["coordinates"] == [[]]
+
+
+def test_smooth_null_feature_raises_value_error() -> None:
+    # A null/non-object feature is bad input: it must raise ValueError (-> 400),
+    # not AttributeError (-> 500).
+    bad = {
+        "type": "FeatureCollection",
+        "features": [
+            None,
+            {
+                "type": "Feature",
+                "properties": {},
+                "geometry": {"type": "LineString", "coordinates": [[0, 0], [1, 1]]},
+            },
+        ],
+    }
+    with pytest.raises(ValueError, match="GeoJSON Feature object"):
+        run_vector_tool("smooth", bad, parameters={"iterations": 1})
+
+
+def test_smooth_preserves_feature_id() -> None:
+    line = {
+        "type": "FeatureCollection",
+        "features": [
+            {
+                "type": "Feature",
+                "id": "abc",
+                "properties": {},
+                "geometry": {"type": "LineString", "coordinates": [[0, 0], [1, 1]]},
+            }
+        ],
+    }
+    geojson, _ = run_vector_tool("smooth", line, parameters={"iterations": 1})
+    assert geojson["features"][0]["id"] == "abc"
+
+
+def test_smooth_preserves_z_coordinates() -> None:
+    line3d = {
+        "type": "FeatureCollection",
+        "features": [
+            {
+                "type": "Feature",
+                "properties": {},
+                "geometry": {
+                    "type": "LineString",
+                    "coordinates": [[0, 0, 100], [0, 10, 200]],
+                },
+            }
+        ],
+    }
+    geojson, _ = run_vector_tool("smooth", line3d, parameters={"iterations": 1})
+    coords = geojson["features"][0]["geometry"]["coordinates"]
+    # Z is interpolated, not dropped: the 1/4 cut point is 100*0.75 + 200*0.25 = 125.
+    assert all(len(c) == 3 for c in coords)
+    assert coords[1] == [0, 2.5, 125]
+
+
+# --- Voronoi / Delaunay ---
+
+
+def _points(*coords: tuple[float, float]) -> dict:
+    return {
+        "type": "FeatureCollection",
+        "features": [
+            {
+                "type": "Feature",
+                "properties": {},
+                "geometry": {"type": "Point", "coordinates": [x, y]},
+            }
+            for x, y in coords
+        ],
+    }
+
+
+@requires_geopandas
+def test_voronoi_produces_polygon_cells() -> None:
+    geojson, messages = run_vector_tool(
+        "voronoi",
+        _points((0, 0), (10, 0), (0, 10), (10, 10), (5, 5)),
+        parameters={"type": "voronoi"},
+    )
+    assert len(geojson["features"]) > 0
+    assert all(f["geometry"]["type"] in ("Polygon", "MultiPolygon") for f in geojson["features"])
+    assert messages and "Voronoi" in messages[0]
+
+
+@requires_geopandas
+def test_delaunay_produces_triangles() -> None:
+    geojson, messages = run_vector_tool(
+        "voronoi",
+        _points((0, 0), (10, 0), (0, 10), (10, 10), (5, 5)),
+        parameters={"type": "delaunay"},
+    )
+    assert len(geojson["features"]) > 0
+    assert all(f["geometry"]["type"] == "Polygon" for f in geojson["features"])
+    assert messages and "Delaunay" in messages[0]
+
+
+@requires_geopandas
+def test_voronoi_requires_three_points() -> None:
+    with pytest.raises(ValueError, match="at least 3 points"):
+        run_vector_tool("voronoi", _points((0, 0), (1, 1)), parameters={})
+
+
+@requires_geopandas
+def test_voronoi_unknown_type_raises() -> None:
+    with pytest.raises(ValueError, match="Unknown diagram type"):
+        run_vector_tool(
+            "voronoi",
+            _points((0, 0), (10, 0), (0, 10)),
+            parameters={"type": "bogus"},
+        )
+
+
+@requires_geopandas
+def test_voronoi_collinear_points_raise() -> None:
+    # Axis-aligned collinear points (zero-area bounds) are rejected before the
+    # diagram-type branch, for both Voronoi and Delaunay.
+    with pytest.raises(ValueError, match="collinear or coincident"):
+        run_vector_tool(
+            "voronoi",
+            _points((0, 0), (0, 5), (0, 10)),
+            parameters={"type": "voronoi"},
+        )
+    with pytest.raises(ValueError, match="collinear or coincident"):
+        run_vector_tool(
+            "voronoi",
+            _points((0, 0), (0, 5), (0, 10)),
+            parameters={"type": "delaunay"},
+        )
+
+
+@requires_geopandas
+def test_voronoi_diagonal_collinear_points_raise() -> None:
+    # Diagonally collinear points have a non-zero-area bbox, so they slip past the
+    # bbox guard but produce no triangle/cell with area; the empty-result guard
+    # reports them rather than returning nothing.
+    with pytest.raises(ValueError, match="collinear"):
+        run_vector_tool(
+            "voronoi",
+            _points((0, 0), (1, 1), (2, 2)),
+            parameters={"type": "delaunay"},
+        )
+
+
+@requires_geopandas
+def test_voronoi_antimeridian_crossing_raises_value_error() -> None:
+    # A layer spanning > 180° of longitude crosses the antimeridian; reject
+    # rather than building an unconstrained cross-world planar envelope.
+    with pytest.raises(ValueError, match="cross the antimeridian"):
+        run_vector_tool(
+            "voronoi",
+            _points((179.0, 10.0), (-179.0, 11.0), (179.5, 12.0)),
+            parameters={"type": "voronoi"},
+        )
+
+
+@requires_geopandas
+def test_voronoi_out_of_range_points_raise_value_error() -> None:
+    # Points past the WGS84 limits would clamp the envelope to a sliver that no
+    # longer contains them; reject them instead of emitting stray cells.
+    with pytest.raises(ValueError, match="valid WGS84 coordinates"):
+        run_vector_tool(
+            "voronoi",
+            _points((181.0, 10.0), (182.0, 11.0), (183.0, 10.0)),
+            parameters={"type": "voronoi"},
+        )
+
+
+@requires_geopandas
+def test_voronoi_non_finite_points_raise_value_error() -> None:
+    # NaN passes every bounds comparison, so it needs its own guard.
+    with pytest.raises(ValueError, match="finite coordinates"):
+        run_vector_tool(
+            "voronoi",
+            _points((float("nan"), 10.0), (1.0, 11.0), (2.0, 10.0)),
+            parameters={"type": "voronoi"},
+        )
+
+
+@requires_geopandas
+def test_voronoi_envelope_clamped_to_wgs84_bounds() -> None:
+    # High-latitude and boundary points must not produce cells with coordinates
+    # outside valid WGS84 geographic limits (lat in [-90, 90], lon in [-180, 180]).
+    arctic_points = _points((0.0, 70.0), (10.0, 80.0), (5.0, 89.0))
+    geojson, _ = run_vector_tool("voronoi", arctic_points, parameters={"type": "voronoi"})
+    assert len(geojson["features"]) > 0
+    from shapely.geometry import shape
+
+    for feature in geojson["features"]:
+        geom = shape(feature["geometry"])
+        minx, miny, maxx, maxy = geom.bounds
+        assert -180.0 <= minx <= 180.0
+        assert -180.0 <= maxx <= 180.0
+        assert -90.0 <= miny <= 90.0
+        assert -90.0 <= maxy <= 90.0
+
+
+@requires_geopandas
+def test_json_wrapper_round_trips() -> None:
+    payload = json.dumps(
+        {
+            "tool_id": "buffer",
+            "geojson": SQUARE,
+            "parameters": {"distance": 1, "units": "kilometers"},
+        }
+    )
+    result = json.loads(run_vector_tool_json(payload))
+    assert set(result) == {"geojson", "messages"}
+    assert result["geojson"]["type"] == "FeatureCollection"
+    assert isinstance(result["messages"], list)
+
+
+BOWTIE = {
+    "type": "FeatureCollection",
+    "features": [
+        {
+            "type": "Feature",
+            "properties": {"name": "bowtie"},
+            "geometry": {
+                "type": "Polygon",
+                "coordinates": [[[0, 0], [2, 2], [2, 0], [0, 2], [0, 0]]],
+            },
+        },
+        {
+            "type": "Feature",
+            "properties": {"name": "ok"},
+            "geometry": {
+                "type": "Polygon",
+                "coordinates": [[[10, 0], [14, 0], [14, 4], [10, 4], [10, 0]]],
+            },
+        },
+    ],
+}
+
+
+@requires_geopandas
+def test_check_validity_marks_invalid_features() -> None:
+    geojson, messages = run_vector_tool("check-validity", BOWTIE)
+    assert geojson["type"] == "FeatureCollection"
+    assert len(geojson["features"]) == 1
+    marker = geojson["features"][0]
+    assert marker["geometry"]["type"] == "Point"
+    assert marker["properties"]["feature_index"] == 0
+    # explain_validity names the problem (e.g. "Self-intersection[...]").
+    assert "intersection" in marker["properties"]["detail"].lower()
+    assert any("1 invalid" in m for m in messages)
+
+
+@requires_geopandas
+def test_check_validity_reports_clean_layer() -> None:
+    geojson, messages = run_vector_tool("check-validity", SQUARE)
+    assert geojson["features"] == []
+    assert any("No invalid geometries" in m for m in messages)
+
+
+@requires_geopandas
+def test_fix_geometries_repairs_only_invalid() -> None:
+    from shapely.geometry import shape
+
+    geojson, messages = run_vector_tool("fix-geometries", BOWTIE)
+    assert len(geojson["features"]) == 2
+    repaired = shape(geojson["features"][0]["geometry"])
+    assert repaired.is_valid
+    assert repaired.geom_type == "MultiPolygon"
+    assert geojson["features"][0]["properties"]["name"] == "bowtie"
+    # The already-valid square keeps its ring untouched.
+    untouched = shape(geojson["features"][1]["geometry"])
+    assert untouched.equals(shape(BOWTIE["features"][1]["geometry"]))
+    assert any("Fixed 1 invalid geometry" in m for m in messages)
+
+
+@requires_geopandas
+def test_fix_geometries_no_op_on_valid_layer() -> None:
+    geojson, messages = run_vector_tool("fix-geometries", SQUARE)
+    assert len(geojson["features"]) == 1
+    assert any("already valid" in m for m in messages)
+
+
+@requires_geopandas
+@pytest.mark.parametrize("failure", ["raises", "returns_empty"])
+def test_fix_geometries_leaves_unfixable_unchanged(monkeypatch, failure: str) -> None:
+    # A degenerate polygon (e.g., <3 distinct points) that make_valid cannot repair
+    # into a valid polygonal area will either raise or return empty. Both are
+    # separate branches of _repair; each leaves the original unchanged and
+    # increments the unfixable count.
+    import shapely.validation
+    from shapely.geometry import Polygon
+
+    def raising_make_valid(_geom: object) -> NoReturn:
+        raise ValueError
+
+    def emptying_make_valid(_geom: object) -> Polygon:
+        return Polygon()
+
+    monkeypatch.setattr(
+        shapely.validation,
+        "make_valid",
+        raising_make_valid if failure == "raises" else emptying_make_valid,
+    )
+
+    degenerate = {
+        "type": "FeatureCollection",
+        "features": [
+            {
+                "type": "Feature",
+                "properties": {"name": "degenerate"},
+                "geometry": {
+                    "type": "Polygon",
+                    "coordinates": [[[0, 0], [1, 1], [0, 0]]],
+                },
+            }
+        ],
+    }
+    geojson, messages = run_vector_tool("fix-geometries", degenerate)
+    assert len(geojson["features"]) == 1
+    # GeoPandas pads the LinearRing to 4 coordinates when loading/dumping
+    coords = geojson["features"][0]["geometry"]["coordinates"]
+    assert coords == [[[0.0, 0.0], [1.0, 1.0], [0.0, 0.0], [0.0, 0.0]]]
+    assert any("1 could not be repaired" in m for m in messages)
+
+
+@requires_geopandas
+def test_validity_anchor_parses_scientific_notation() -> None:
+    anchor = vector_ops._validity_anchor("Self-intersection[1.5e-10 -2.3e-05]", None)
+    assert anchor == (1.5e-10, -2.3e-05)
+
+
+@requires_geopandas
+def test_check_validity_counts_empty_geometry_as_missing() -> None:
+    with_empty = {
+        "type": "FeatureCollection",
+        "features": [
+            SQUARE["features"][0],
+            {
+                "type": "Feature",
+                "properties": {"name": "empty"},
+                "geometry": {"type": "Polygon", "coordinates": []},
+            },
+        ],
+    }
+    _, messages = run_vector_tool("check-validity", with_empty)
+    assert any("1 without geometry" in m for m in messages)
+    assert any("Checked 1 feature(s)" in m for m in messages)
+
+
+@requires_geopandas
+@pytest.mark.parametrize(
+    "tolerance", [-1, -0.001, True, False, float("nan"), float("inf"), float("-inf")]
+)
+def test_simplify_negative_or_non_finite_tolerance_raises_value_error(tolerance: object) -> None:
+    with pytest.raises(
+        ValueError, match="Simplify tolerance must be a finite, non-negative number"
+    ):
+        run_vector_tool("simplify", SQUARE, parameters={"tolerance": tolerance})
+
+
+@requires_geopandas
+def test_simplify_unparseable_tolerance_raises_value_error() -> None:
+    with pytest.raises(
+        ValueError, match="Simplify tolerance must be a finite, non-negative number"
+    ):
+        run_vector_tool("simplify", SQUARE, parameters={"tolerance": "invalid_num"})
+
+
+@requires_geopandas
+def test_simplify_defaults_missing_tolerance() -> None:
+    geojson, messages = run_vector_tool("simplify", SQUARE)
+    assert len(geojson["features"]) == 1
+    assert any("tolerance 0.01 degrees" in m for m in messages)
+
+
+@requires_geopandas
+@pytest.mark.parametrize(
+    ("tolerance", "expected_tolerance"),
+    [
+        (0, "tolerance 0.0 degrees"),
+        (None, "tolerance 0.01 degrees"),
+        (0.05, "tolerance 0.05 degrees"),
+    ],
+)
+def test_simplify_preserves_boundary_tolerances(tolerance: object, expected_tolerance: str) -> None:
+    geojson, messages = run_vector_tool("simplify", SQUARE, parameters={"tolerance": tolerance})
+    assert len(geojson["features"]) == 1
+    assert any(expected_tolerance in m for m in messages)
+
+
+NULL_GEOM_LAYER = {
+    "type": "FeatureCollection",
+    "features": [
+        {
+            "type": "Feature",
+            "properties": {"name": "no_geom"},
+            "geometry": None,
+        }
+    ],
+}
+
+
+@requires_geopandas
+def test_bounding_box_empty_geometries_raises_value_error() -> None:
+    with pytest.raises(ValueError, match="contains no valid geometry to compute a bounding box"):
+        run_vector_tool("bounding-box", NULL_GEOM_LAYER)
+
+
+@requires_geopandas
+def test_bounding_box_computes_expected_bounds() -> None:
+    geojson, messages = run_vector_tool("bounding-box", SQUARE)
+    assert len(geojson["features"]) == 1
+    coords = geojson["features"][0]["geometry"]["coordinates"][0]
+    assert len(coords) == 5
+    assert coords == [
+        [1.0, 0.0],
+        [1.0, 1.0],
+        [0.0, 1.0],
+        [0.0, 0.0],
+        [1.0, 0.0],
+    ]
+    assert any("Computed bounding box" in m for m in messages)
+
+
+@requires_geopandas
+def test_buffer_empty_geometries_raises_value_error() -> None:
+    with pytest.raises(ValueError, match="contains no valid geometry coordinates to project"):
+        run_vector_tool("buffer", NULL_GEOM_LAYER, parameters={"distance": 1})
+
+
+@requires_geopandas
+def test_centroids_empty_geometries_raises_value_error() -> None:
+    with pytest.raises(ValueError, match="contains no valid geometry coordinates to project"):
+        run_vector_tool("centroids", NULL_GEOM_LAYER)

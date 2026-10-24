@@ -1,0 +1,209 @@
+import {
+  Button,
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuLabel,
+  DropdownMenuSeparator,
+  DropdownMenuTrigger,
+} from "@geolibre/ui";
+import { Database } from "lucide-react";
+import { useAppStore, type MapRendererKind } from "@geolibre/core";
+import { Fragment, useMemo } from "react";
+import { useTranslation } from "react-i18next";
+import type { AddDataKind } from "../AddDataDialog";
+import { isMobile } from "../../../lib/is-mobile";
+import { masHidesDataSource } from "../../../lib/mas-build";
+import { useDesktopSettingsStore } from "../../../hooks/useDesktopSettings";
+import { useMapCapabilities } from "../../../hooks/useMapCapabilities";
+import { requiresArcgisDeckOverlay, supportsAddDataRenderer } from "../../../lib/add-data-renderer";
+import {
+  DATA_SOURCE_CATALOG,
+  DATA_SOURCE_SECTION_LABEL_KEYS,
+  DATA_SOURCE_SECTION_ORDER,
+  isDataSourceVisible,
+} from "../../../lib/ui-profile";
+import type { AddLayerHandlers, ToolbarChrome } from "./constants";
+import { PluginMenuContributions } from "./PluginMenuContributions";
+
+interface AddDataMenuProps {
+  chrome: ToolbarChrome;
+  addLayer: AddLayerHandlers;
+  osmPbfBusy: boolean;
+  disabled?: boolean;
+  onSetAddDataKind: (kind: AddDataKind) => void;
+  onAddGltfModel: () => void;
+  onOpenOsmPbfDialog: () => void;
+}
+
+interface AddDataItem {
+  onSelect: () => void;
+  disabled?: boolean;
+}
+
+function unsupportedTitleKey(renderer: MapRendererKind, id: string) {
+  // eslint-disable-next-line local/no-renderer-kind-checks -- the message names the engine
+  if (renderer !== "arcgis") return "renderer.layerMapboxUnsupported";
+  return requiresArcgisDeckOverlay(id)
+    ? "renderer.layerArcgisViewUnsupported"
+    : "renderer.layerArcgisUnsupported";
+}
+
+/** The Add Data menu: files, web services, cloud formats, 3D layers, databases. */
+export function AddDataMenu({
+  chrome,
+  addLayer,
+  osmPbfBusy,
+  disabled = false,
+  onSetAddDataKind,
+  onAddGltfModel,
+  onOpenOsmPbfDialog,
+}: AddDataMenuProps) {
+  const { t } = useTranslation();
+  const uiProfile = useDesktopSettingsStore((state) => state.desktopSettings.uiProfile);
+  const capabilities = useMapCapabilities();
+  const renderer = useAppStore((state) => state.primaryRenderer);
+  // PostgreSQL layers are served through the Martin tile server, a local helper
+  // binary with no Android build, so hide the source on mobile.
+  // The user agent is stable for the session, so evaluate once.
+  const mobile = useMemo(() => isMobile(), []);
+
+  // Map each catalog id to its dispatch. Kept here (not in the catalog) so the
+  // handlers stay in scope; the catalog only owns ids, sections, and tiers.
+  const handlers: Record<string, AddDataItem> = {
+    vector: { onSelect: addLayer.vector },
+    raster: { onSelect: addLayer.raster },
+    "delimited-text": { onSelect: () => onSetAddDataKind("delimited-text") },
+    cad: { onSelect: () => onSetAddDataKind("cad") },
+    gdb: { onSelect: () => onSetAddDataKind("gdb") },
+    photos: { onSelect: () => onSetAddDataKind("photos") },
+    gpx: { onSelect: () => onSetAddDataKind("gpx") },
+    landxml: { onSelect: () => onSetAddDataKind("landxml") },
+    polyline: { onSelect: () => onSetAddDataKind("polyline") },
+    mbtiles: { onSelect: () => onSetAddDataKind("mbtiles") },
+    "osm-pbf": { onSelect: onOpenOsmPbfDialog, disabled: osmPbfBusy },
+    xyz: { onSelect: () => onSetAddDataKind("xyz") },
+    wcs: { onSelect: () => onSetAddDataKind("wcs") },
+    wms: { onSelect: () => onSetAddDataKind("wms") },
+    csw: { onSelect: () => onSetAddDataKind("csw") },
+    wfs: { onSelect: () => onSetAddDataKind("wfs") },
+    wmts: { onSelect: () => onSetAddDataKind("wmts") },
+    "ogc-features": { onSelect: () => onSetAddDataKind("ogc-features") },
+    "ogc-vector-tiles": {
+      onSelect: () => onSetAddDataKind("ogc-vector-tiles"),
+    },
+    arcgis: { onSelect: () => onSetAddDataKind("arcgis") },
+    georss: { onSelect: () => onSetAddDataKind("georss") },
+    geoboundaries: { onSelect: () => onSetAddDataKind("geoboundaries") },
+    stac: { onSelect: addLayer.stac },
+    video: { onSelect: () => onSetAddDataKind("video") },
+    // deck.gl draws through a shared overlay on MapLibre, Mapbox and supported
+    // ArcGIS views. Offer the builder only where the engine hosts that overlay.
+    "deckgl-viz": {
+      onSelect: () => onSetAddDataKind("deckgl-viz"),
+      disabled: !capabilities.deckOverlay,
+    },
+    // GeoParquet loads through the same vector file picker as "vector"; keep
+    // both pointing at addLayer.vector if that handler ever changes.
+    geoparquet: { onSelect: addLayer.vector },
+    flatgeobuf: { onSelect: addLayer.flatGeobuf },
+    pmtiles: { onSelect: addLayer.pmtiles },
+    zarr: { onSelect: addLayer.zarr },
+    netcdf: { onSelect: addLayer.netcdf },
+    // On an ArcGIS view without the deck.gl overlay, LiDAR and 3D Tiles are
+    // disabled by `supportsAddDataRenderer` below (`requiresArcgisDeckOverlay`).
+    lidar: { onSelect: addLayer.lidar },
+    "spaceborne-lidar": { onSelect: addLayer.spaceborneLidar },
+    splatting: { onSelect: addLayer.splatting },
+    "3d-tiles": { onSelect: addLayer.threeDTiles },
+    // Ion assets load through Cesium only (issue #2290); on the 2D map the
+    // entry stays visible but disabled so the capability is discoverable.
+    "cesium-ion": {
+      onSelect: () => onSetAddDataKind("cesium-ion"),
+      disabled: !capabilities.nativeDataSources,
+    },
+    // CZML dynamic 3D scenes load through Cesium only (issue #2290).
+    czml: { onSelect: () => onSetAddDataKind("czml"), disabled: !capabilities.nativeDataSources },
+    // KML/KMZ loads natively on the globe and through the host KML importer
+    // (the drag-and-drop path) on the 2D renderers, so it is never gated.
+    kml: { onSelect: () => onSetAddDataKind("kml") },
+    // The glTF model opens the same deck.gl scenegraph builder, so it is
+    // gated the way "deckgl-viz" is.
+    "gltf-model": { onSelect: onAddGltfModel, disabled: !capabilities.deckOverlay },
+    // DuckDB results draw through the panel's own deck.gl overlay, so the
+    // entry follows the same gate as the Deck.gl builder.
+    duckdb: { onSelect: addLayer.duckdb, disabled: !capabilities.deckOverlay },
+    postgres: { onSelect: () => onSetAddDataKind("postgres") },
+    mssql: { onSelect: () => onSetAddDataKind("mssql") },
+    iceberg: { onSelect: () => onSetAddDataKind("iceberg") },
+  };
+
+  // Each rendered section is the catalog entries it owns, filtered by the UI
+  // profile (and the mobile rule for the database sources, and the Mac App Store rule for
+  // the sidecar/martin-only sources). Sections with no visible items are
+  // dropped along with their header/separator.
+  const sections = DATA_SOURCE_SECTION_ORDER.map((section) => ({
+    section,
+    entries: DATA_SOURCE_CATALOG.filter(
+      (entry) =>
+        entry.section === section &&
+        isDataSourceVisible(uiProfile, entry.id) &&
+        !((entry.id === "postgres" || entry.id === "mssql") && mobile) &&
+        !masHidesDataSource(entry.id),
+    ),
+  })).filter((group) => group.entries.length > 0);
+
+  return (
+    <DropdownMenu>
+      <DropdownMenuTrigger asChild>
+        <Button
+          className={chrome.buttonClass}
+          variant="ghost"
+          size={chrome.buttonSize}
+          aria-label={t("toolbar.menu.addData")}
+          disabled={disabled}
+        >
+          <Database className={chrome.iconClassName} />
+          {chrome.renderLabel(t("toolbar.menu.addData"))}
+        </Button>
+      </DropdownMenuTrigger>
+      {/* No width class: the primitive's min-w-[8rem] floor plus shrink-to-fit
+          sizes the menu to its longest label, the way Processing/Controls/Help
+          already do. A fixed w-64 pinned it to 256px whatever it held, which
+          left ~100px of dead space to the right of every entry, and would clip
+          a locale whose labels run past 256px instead of growing. */}
+      <DropdownMenuContent align="start">
+        <DropdownMenuLabel>{t("toolbar.menu.addData")}</DropdownMenuLabel>
+        <DropdownMenuSeparator />
+        {sections.map((group, index) => (
+          <Fragment key={group.section}>
+            {index > 0 ? <DropdownMenuSeparator /> : null}
+            <DropdownMenuLabel className="text-xs text-muted-foreground">
+              {t(DATA_SOURCE_SECTION_LABEL_KEYS[group.section])}
+            </DropdownMenuLabel>
+            {group.entries.map((entry) => {
+              const item = handlers[entry.id];
+              if (!item) return null;
+              const supported = supportsAddDataRenderer(
+                entry.id,
+                renderer,
+                capabilities.deckOverlay,
+              );
+              return (
+                <DropdownMenuItem
+                  key={entry.id}
+                  disabled={item.disabled || !supported}
+                  title={supported ? undefined : t(unsupportedTitleKey(renderer, entry.id))}
+                  onSelect={item.onSelect}
+                >
+                  {t(entry.labelKey)}
+                </DropdownMenuItem>
+              );
+            })}
+          </Fragment>
+        ))}
+        <PluginMenuContributions target="addData" />
+      </DropdownMenuContent>
+    </DropdownMenu>
+  );
+}

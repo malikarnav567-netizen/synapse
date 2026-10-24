@@ -1,0 +1,580 @@
+import assert from "node:assert/strict";
+import { describe, it } from "node:test";
+import {
+  fileOutputTargetExtension,
+  lidarBytesExtension,
+  lidarOutputTargetExtension,
+  manifestScalarDefaults,
+  mergeWasmToolManifests,
+  normalizeVectorOutputFormat,
+  outputTextFormatHint,
+  type ToolManifest,
+  type WhiteboxTool,
+} from "@geolibre/processing";
+
+// The Whitebox catalog snapshot (from the Python sidecar) names reproject_vector's
+// destination-CRS parameter `dst_epsg` and carries sidecar-only extras. The WASM
+// binary's own manifest for the same tool validates `epsg` instead, so building
+// CLI args from the catalog fails with "parameter 'epsg' is required" (#1047).
+const catalogReprojectVector: WhiteboxTool = {
+  id: "reproject_vector",
+  display_name: "Reproject Vector",
+  category: "Projection and Georeferencing",
+  params: [
+    { name: "input", kind: "vector_in", required: true },
+    { name: "dst_epsg", kind: "int", required: true },
+    { name: "output", kind: "file_out", required: true },
+    { name: "failure_policy", kind: "string", required: false },
+    { name: "antimeridian_policy", kind: "string", required: false },
+  ],
+};
+
+const wasmReprojectVector: WhiteboxTool = {
+  id: "reproject_vector",
+  display_name: "Reproject Vector",
+  category: "Vector",
+  params: [
+    { name: "input", data_kind: "vector", io_role: "input", required: true },
+    { name: "epsg", data_kind: "number", required: true },
+    { name: "output", data_kind: "vector", io_role: "output", required: true },
+  ],
+};
+
+const geolibreOnlyTool: WhiteboxTool = {
+  id: "write_geoparquet",
+  display_name: "Write GeoParquet",
+  source: "geolibre",
+  params: [{ name: "input", data_kind: "vector", io_role: "input" }],
+};
+
+describe("mergeWasmToolManifests", () => {
+  it("replaces a catalog tool's params with the WASM manifest's", () => {
+    const merged = mergeWasmToolManifests([catalogReprojectVector], [wasmReprojectVector]);
+    const tool = merged.find((item) => item.id === "reproject_vector");
+    assert.ok(tool, "reproject_vector should still be present");
+    // The WASM binary's parameter names win, so args are built as `--epsg=...`.
+    assert.deepEqual(
+      tool.params?.map((param) => param.name),
+      ["input", "epsg", "output"],
+    );
+    // Catalog display metadata is preserved (only params are overridden).
+    assert.equal(tool.category, "Projection and Georeferencing");
+  });
+
+  it("keeps catalog params when the WASM binary lacks the tool", () => {
+    const merged = mergeWasmToolManifests([catalogReprojectVector], []);
+    const tool = merged.find((item) => item.id === "reproject_vector");
+    assert.deepEqual(
+      tool?.params?.map((param) => param.name),
+      ["input", "dst_epsg", "output", "failure_policy", "antimeridian_policy"],
+    );
+  });
+
+  it("appends GeoLibre-authored tools absent from the catalog", () => {
+    const merged = mergeWasmToolManifests(
+      [catalogReprojectVector],
+      [wasmReprojectVector, geolibreOnlyTool],
+    );
+    assert.ok(
+      merged.some((tool) => tool.id === "write_geoparquet"),
+      "GeoLibre-only tool should be appended",
+    );
+    // The WASM whitebox match is consumed, not duplicated as a WASM-only entry.
+    assert.equal(merged.filter((tool) => tool.id === "reproject_vector").length, 1);
+  });
+
+  it("appends Whitebox-sourced WASM tools the catalog snapshot omits", () => {
+    // The WASM binary ships Whitebox tools the Whitebox Next Gen snapshot has
+    // never listed (buffer_vector, the variogram/cokriging tools,
+    // greater_than_or_equal_to, less_than_or_equal_to). They run through the
+    // WASM runner like any other, so dropping them left the dialog listing
+    // fewer tools than the binary provides.
+    // Whitebox provenance is an unset `source` once a manifest is converted.
+    const wasmOnlyWhitebox: WhiteboxTool = {
+      id: "buffer_vector",
+      display_name: "Buffer Vector",
+      params: [{ name: "input", data_kind: "vector", io_role: "input" }],
+    };
+    const merged = mergeWasmToolManifests(
+      [catalogReprojectVector],
+      [wasmReprojectVector, wasmOnlyWhitebox],
+    );
+    assert.ok(
+      merged.some((tool) => tool.id === "buffer_vector"),
+      "WASM-only Whitebox tool should be appended",
+    );
+    // Still no duplicate for the tool that does have a catalog entry.
+    assert.equal(merged.filter((tool) => tool.id === "reproject_vector").length, 1);
+  });
+
+  it("consumes a matched GeoLibre tool once and preserves its source", () => {
+    // A GeoLibre-authored tool that also has a catalog stub must be merged once
+    // (never appended a second time via the GeoLibre-only leftovers), take the
+    // WASM manifest's params, and keep its "geolibre" source so the source
+    // filter still recognises it.
+    const catalogStub: WhiteboxTool = {
+      id: "write_geoparquet",
+      display_name: "Write GeoParquet",
+      params: [{ name: "input", kind: "vector_in", required: true }],
+    };
+    const wasmTool: WhiteboxTool = {
+      id: "write_geoparquet",
+      source: "geolibre",
+      params: [
+        { name: "input", data_kind: "vector", io_role: "input" },
+        { name: "compression", data_kind: "string" },
+      ],
+    };
+    const merged = mergeWasmToolManifests([catalogStub], [wasmTool]);
+    assert.equal(merged.filter((tool) => tool.id === "write_geoparquet").length, 1);
+    assert.deepEqual(
+      merged[0].params?.map((param) => param.name),
+      ["input", "compression"],
+    );
+    assert.equal(merged[0].source, "geolibre");
+    // Catalog display metadata is retained.
+    assert.equal(merged[0].display_name, "Write GeoParquet");
+  });
+
+  it("corrects a WASM param the manifest mislabels as a dataset/bool (#1073)", () => {
+    // The WASM binary types extract_by_attribute's `statement` expression as a
+    // bool (a checkbox) and field_calculator's `expression` as a vector input (a
+    // second layer picker), so neither exposes a text field. The catalog types
+    // both as plain strings; that scalar kind must win for matched param names.
+    const catalog: WhiteboxTool = {
+      id: "field_calculator",
+      display_name: "Field Calculator",
+      params: [
+        { name: "input", kind: "vector_in", required: true },
+        { name: "field", kind: "string", required: true },
+        { name: "field_type", kind: "int", required: false },
+        { name: "expression", kind: "string", required: true },
+        { name: "output", kind: "vector_out", required: false },
+      ],
+    };
+    const wasm: WhiteboxTool = {
+      id: "field_calculator",
+      params: [
+        { name: "input", data_kind: "vector", io_role: "input", required: true },
+        { name: "field", data_kind: "string", required: true },
+        // A real enum/dropdown: its kind must be left alone, not coerced to int.
+        {
+          name: "field_type",
+          schema: { kind: "enum", options: [{ value: "float" }] },
+          options: ["float", "integer", "text"],
+        },
+        // Mislabeled as a vector input; the catalog's `string` must win.
+        {
+          name: "expression",
+          data_kind: "vector",
+          io_role: "input",
+          required: true,
+        },
+        { name: "output", data_kind: "vector", io_role: "output" },
+      ],
+    };
+    const [tool] = mergeWasmToolManifests([catalog], [wasm]);
+    const byName = new Map(tool.params?.map((p) => [p.name, p]));
+    // Param names/set still come from the WASM manifest.
+    assert.deepEqual(
+      tool.params?.map((p) => p.name),
+      ["input", "field", "field_type", "expression", "output"],
+    );
+    // The mislabeled expression is corrected to a string (a text field).
+    assert.equal(byName.get("expression")?.kind, "string");
+    // A genuine enum keeps its dropdown; the catalog's `int` does not clobber it.
+    assert.equal(byName.get("field_type")?.kind, undefined);
+    // Matching dataset kinds are untouched (no spurious override).
+    assert.equal(byName.get("input")?.kind, undefined);
+  });
+
+  it("corrects a bool-typed expression param to a string (#1073)", () => {
+    const catalog: WhiteboxTool = {
+      id: "extract_by_attribute",
+      params: [
+        { name: "input", kind: "vector_in", required: true },
+        { name: "statement", kind: "string", required: true },
+        { name: "output", kind: "vector_out", required: true },
+      ],
+    };
+    const wasm: WhiteboxTool = {
+      id: "extract_by_attribute",
+      params: [
+        { name: "input", data_kind: "vector", io_role: "input", required: true },
+        { name: "statement", data_kind: "bool", required: true },
+        { name: "output", data_kind: "vector", io_role: "output", required: true },
+      ],
+    };
+    const [tool] = mergeWasmToolManifests([catalog], [wasm]);
+    const statement = tool.params?.find((p) => p.name === "statement");
+    assert.equal(statement?.kind, "string");
+  });
+
+  it("does not downgrade a genuine dataset input the catalog mistyped scalar", () => {
+    // Only expression/statement-named inputs are corrected; a real raster/vector
+    // input whose name is not an expression must keep its WASM dataset kind even
+    // if the catalog snapshot mistypes it as a string.
+    const catalog: WhiteboxTool = {
+      id: "some_tool",
+      params: [{ name: "input", kind: "string", required: true }],
+    };
+    const wasm: WhiteboxTool = {
+      id: "some_tool",
+      params: [{ name: "input", data_kind: "raster", io_role: "input", required: true }],
+    };
+    const [tool] = mergeWasmToolManifests([catalog], [wasm]);
+    assert.equal(tool.params?.[0]?.kind, undefined);
+  });
+
+  it("never overrides a WASM output param, even if the catalog types it scalar", () => {
+    // A scalar-typed catalog output must not divert a genuine WASM dataset
+    // output into the plain-arg path (which would break its run). Only inputs
+    // and bools are corrected.
+    const catalog: WhiteboxTool = {
+      id: "some_tool",
+      params: [{ name: "output", kind: "string", required: true }],
+    };
+    const wasm: WhiteboxTool = {
+      id: "some_tool",
+      params: [{ name: "output", data_kind: "vector", io_role: "output", required: true }],
+    };
+    const [tool] = mergeWasmToolManifests([catalog], [wasm]);
+    // Kind stays unset so parameterKind resolves the WASM vector_out.
+    assert.equal(tool.params?.[0]?.kind, undefined);
+  });
+
+  it("appends a WASM-only Whitebox tool even when the catalog is empty", () => {
+    // This used to assert the opposite: only `source: "geolibre"` leftovers were
+    // appended, on the assumption that every Whitebox tool worth listing was in
+    // the catalog snapshot. It is not — the WASM ships buffer_vector, the
+    // variogram/cokriging tools and the >=/<= comparisons, which the snapshot
+    // has never listed. They execute through the WASM runner (buffer_vector
+    // turns 2 points into 2 polygons), so dropping them hid working tools.
+    // Whitebox provenance is an unset `source` once a manifest is converted.
+    const wasmOnlyWhitebox: WhiteboxTool = {
+      id: "some_wasm_only_whitebox_tool",
+      params: [{ name: "input", data_kind: "raster", io_role: "input" }],
+    };
+    const merged = mergeWasmToolManifests([], [wasmOnlyWhitebox]);
+    assert.deepEqual(
+      merged.map((tool) => tool.id),
+      ["some_wasm_only_whitebox_tool"],
+    );
+  });
+
+  it("hides a locked WASM-only pro-tier tool", () => {
+    const merged = mergeWasmToolManifests(
+      [],
+      [
+        { id: "pro_tool", locked: true, params: [] },
+        { id: "free_tool", locked: false, params: [] },
+      ],
+    );
+    assert.deepEqual(
+      merged.map((tool) => tool.id),
+      ["free_tool"],
+    );
+  });
+
+  it("keeps catalog params when the WASM manifest declares none", () => {
+    // geolibre-wasm ships 138 manifests with an empty `params` array — every
+    // Hydrology → Flow Routing tool among them (d8_pointer, fill_depressions,
+    // aspect, basins, …) — while the binary still requires those parameters:
+    // running any of the 138 with no arguments fails with "validation error:
+    // missing required parameter '…'". Trusting the empty set showed "This tool
+    // has no parameters." in the Processing dialog and left the tool unrunnable
+    // in local (WASM) mode. The catalog's params are the fallback, exactly as
+    // the sidecar path does via mergeCatalogParameterFallbacks.
+    const catalogD8Pointer: WhiteboxTool = {
+      id: "d8_pointer",
+      display_name: "D8 Pointer",
+      category: "Hydrology - Flow Routing",
+      params: [
+        { name: "dem", kind: "raster_in", required: true },
+        { name: "esri_pntr", kind: "bool", required: false, default: false },
+        { name: "output", kind: "raster_out", required: true },
+      ],
+    };
+    const wasmD8Pointer: WhiteboxTool = {
+      id: "d8_pointer",
+      display_name: "D8 Pointer",
+      category: "Raster",
+      params: [],
+    };
+    const [tool] = mergeWasmToolManifests([catalogD8Pointer], [wasmD8Pointer]);
+    // Compare the whole params, not just the names: `kind` decides how the
+    // dialog renders each field (a dropped one turns a raster picker into a
+    // text box), and `required`/`default` seed createDefaultValues and gate Run.
+    assert.deepEqual(tool.params, catalogD8Pointer.params);
+    // Still a catalog merge, not a passthrough: display metadata is the catalog's.
+    assert.equal(tool.category, "Hydrology - Flow Routing");
+  });
+
+  it("leaves a WASM-only tool with no params alone", () => {
+    // Nothing to fall back to when the catalog does not list the tool at all;
+    // it must still be listed rather than dropped.
+    const merged = mergeWasmToolManifests([], [{ id: "some_tool", params: [] }]);
+    assert.deepEqual(merged[0].params, []);
+  });
+
+  it("fills a missing WASM default from the catalog (#1458)", () => {
+    // The WASM manifest is authoritative for parameter names and kinds, but it
+    // does not always carry defaults; the catalog does. Without this, an
+    // optional flag the tool documents as on rendered as an unchecked box and
+    // was sent as `false`.
+    const catalog: WhiteboxTool = {
+      id: "some_tool",
+      params: [
+        { name: "input", kind: "vector_in", required: true, default: null },
+        { name: "keep_ends", kind: "bool", required: false, default: true },
+        { name: "output", kind: "vector_out", required: true, default: null },
+      ],
+    };
+    const wasm: WhiteboxTool = {
+      id: "some_tool",
+      params: [
+        { name: "input", data_kind: "vector", io_role: "input", required: true },
+        { name: "keep_ends", data_kind: "bool", required: false },
+        { name: "output", data_kind: "vector", io_role: "output", required: true },
+      ],
+    };
+    const [tool] = mergeWasmToolManifests([catalog], [wasm]);
+    assert.equal(tool.params?.find((param) => param.name === "keep_ends")?.default, true);
+    // Dataset params keep no default: a catalog path would be meaningless here,
+    // and the dialog renders their picker from `kind`, not from a value.
+    assert.equal(tool.params?.find((param) => param.name === "input")?.default, undefined);
+  });
+
+  it("never overwrites a default the WASM manifest already declares", () => {
+    const catalog: WhiteboxTool = {
+      id: "some_tool",
+      params: [{ name: "mode", kind: "string", default: "catalog" }],
+    };
+    const wasm: WhiteboxTool = {
+      id: "some_tool",
+      params: [{ name: "mode", data_kind: "string", default: "wasm" }],
+    };
+    const [tool] = mergeWasmToolManifests([catalog], [wasm]);
+    assert.equal(tool.params?.[0].default, "wasm");
+  });
+});
+
+describe("manifestScalarDefaults", () => {
+  // points_along_lines, trimmed to the parts that matter. Its `defaults` map
+  // doubles as the tool's example invocation, so it lists a `lines.shp` input
+  // path and a `spacing` of 50 next to the one real default, `include_end`.
+  const pointsAlongLines: ToolManifest = {
+    id: "points_along_lines",
+    defaults: { include_end: true, input: "lines.shp", spacing: 50 },
+    params: [
+      { name: "input", data_kind: "vector", io_role: "input", required: true },
+      { name: "spacing", data_kind: "number", required: true },
+      { name: "include_end", data_kind: "bool", required: false },
+      { name: "output", data_kind: "vector", io_role: "output", required: true },
+    ],
+  };
+
+  it("keeps an optional scalar default the tool documents (#1458)", () => {
+    // "Include line endpoints (default true)" rendered as an unchecked box, so
+    // `--include_end=false` went to the runner and every line lost its endpoint:
+    // spacing 0.1 over a 0.36-degree line gave 3 points instead of 4, and 0.2
+    // gave a single point that looked like nothing had happened.
+    assert.deepEqual(manifestScalarDefaults(pointsAlongLines), { include_end: true });
+  });
+
+  it("drops dataset and required entries, which are example values", () => {
+    const defaults = manifestScalarDefaults(pointsAlongLines);
+    // `lines.shp` does not exist on the user's machine, and 50 is an arbitrary
+    // value for a required distance the user must supply.
+    assert.equal("input" in defaults, false);
+    assert.equal("spacing" in defaults, false);
+  });
+
+  it("returns nothing when the manifest declares no defaults", () => {
+    assert.deepEqual(manifestScalarDefaults({ id: "some_tool", params: [{ name: "mode" }] }), {});
+  });
+});
+
+describe("normalizeVectorOutputFormat", () => {
+  it("passes through the known formats", () => {
+    for (const format of ["geojson", "geoparquet", "flatgeobuf", "shapefile"]) {
+      assert.equal(normalizeVectorOutputFormat(format), format);
+    }
+  });
+
+  it("falls back to geojson for a stale output path or bad value", () => {
+    // A leftover sidecar-mode path (or any non-format string/undefined) must not
+    // be treated as a format, else the WASM runner writes `..._output.undefined`.
+    assert.equal(normalizeVectorOutputFormat("/Users/me/output.shp"), "geojson");
+    assert.equal(normalizeVectorOutputFormat(""), "geojson");
+    assert.equal(normalizeVectorOutputFormat(undefined), "geojson");
+    assert.equal(normalizeVectorOutputFormat(42), "geojson");
+  });
+});
+
+describe("fileOutputTargetExtension", () => {
+  // vector_summary_statistics' output param, as the WASM manifest reports it.
+  const tableOutput = {
+    name: "output",
+    description: "Output CSV path.",
+    data_kind: "table",
+    io_role: "output",
+    schema: { dataset: { kind: "table" }, kind: "output", mode: "new" },
+  };
+
+  it("honors the extension of the user-chosen output path", () => {
+    // The bug in #1074: a hardcoded ".dat" made vector_summary_statistics reject
+    // its own output path. The user's ".csv" choice must reach the tool.
+    assert.equal(fileOutputTargetExtension(tableOutput, "test.csv"), "csv");
+    assert.equal(fileOutputTargetExtension(tableOutput, "/Users/me/report.JSON"), "json");
+  });
+
+  it("defaults a table output to csv when no path is given", () => {
+    assert.equal(fileOutputTargetExtension(tableOutput, undefined), "csv");
+    assert.equal(fileOutputTargetExtension(tableOutput, ""), "csv");
+  });
+
+  it("sniffs the format from the description when no path/table is given", () => {
+    // A JSON/HTML report param whose format lives only in its prose must not
+    // fall through to .dat when the output field is blank (would reproduce #1074
+    // for that tool).
+    const jsonReport = {
+      name: "output",
+      description: "Optional output report path (.json or .csv).",
+      data_kind: "file",
+      io_role: "output",
+    };
+    // csv wins over json in the hint order (both are valid for this tool).
+    assert.equal(fileOutputTargetExtension(jsonReport, undefined), "csv");
+    const jsonOnly = {
+      name: "match_report",
+      description: "Optional JSON output path for summary diagnostics.",
+      data_kind: "file",
+      io_role: "output",
+    };
+    assert.equal(fileOutputTargetExtension(jsonOnly, undefined), "json");
+  });
+
+  it("falls back to an opaque .dat for a non-table, non-text output", () => {
+    const opaque = { name: "output", data_kind: "file", io_role: "output" };
+    assert.equal(fileOutputTargetExtension(opaque, undefined), "dat");
+  });
+
+  it("honors a recommended extension in the description over the table default", () => {
+    // excel_to_table's output param, as the WASM manifest reports it: data_kind
+    // "table" would otherwise default to .csv, but the writer is the generic
+    // vector format dispatch (no CSV driver) and the description already names
+    // the extension that does work.
+    const excelToTable = {
+      name: "file_out",
+      description:
+        "Optional output table path (driver from its extension; GeoParquet .parquet recommended). If omitted, stored in memory.",
+      data_kind: "table",
+      io_role: "output",
+    };
+    assert.equal(fileOutputTargetExtension(excelToTable, undefined), "parquet");
+    assert.equal(fileOutputTargetExtension(excelToTable, ""), "parquet");
+    // An explicit user-chosen path still wins.
+    assert.equal(fileOutputTargetExtension(excelToTable, "report.gpkg"), "gpkg");
+  });
+
+  it("ignores a decimal in the prose rather than reading it as an extension", () => {
+    const decimalProse = {
+      name: "file_out",
+      description: "Optional CSV output path; a tolerance of 0.5 recommended for noisy inputs.",
+      data_kind: "table",
+      io_role: "output",
+    };
+    assert.equal(fileOutputTargetExtension(decimalProse, undefined), "csv");
+  });
+});
+
+describe("outputTextFormatHint name words", () => {
+  it("reads a format named by one word of a snake/kebab/camelCase name", () => {
+    // directional_variogram's `output_json`, as the WASM manifest reports it:
+    // its description never says JSON, and `_` is a word character, so the
+    // old `\bjson\b` rule missed the name and the tool wrote an opaque `.dat`.
+    const variogram = {
+      name: "output_json",
+      description: "Output file path for directional variogram results",
+      data_kind: "file",
+      io_role: "output",
+    };
+    assert.equal(outputTextFormatHint(variogram), "json");
+    assert.equal(fileOutputTargetExtension(variogram, undefined), "json");
+    assert.equal(outputTextFormatHint({ name: "report-html" }), "html");
+    assert.equal(outputTextFormatHint({ name: "summaryCsv" }), "csv");
+    assert.equal(outputTextFormatHint({ name: "CSVOutput" }), "csv");
+  });
+
+  it("does not match a format buried inside a longer word", () => {
+    assert.equal(outputTextFormatHint({ name: "csvlike_output" }), null);
+    assert.equal(outputTextFormatHint({ name: "jsonish" }), null);
+  });
+});
+
+describe("lidarOutputTargetExtension", () => {
+  it("honours a user-typed .laz path", () => {
+    assert.equal(lidarOutputTargetExtension("classified.laz"), "laz");
+    assert.equal(lidarOutputTargetExtension(" /data/OUT.LAZ "), "laz");
+  });
+
+  it("honours a user-typed .copc.laz path", () => {
+    assert.equal(lidarOutputTargetExtension("thinned.copc.laz"), "copc.laz");
+    assert.equal(lidarOutputTargetExtension(" /data/OUT.COPC.LAZ "), "copc.laz");
+  });
+
+  it("keeps uncompressed .las for anything else", () => {
+    assert.equal(lidarOutputTargetExtension("classified.las"), "las");
+    assert.equal(lidarOutputTargetExtension("classified.laz.bak"), "las");
+    assert.equal(lidarOutputTargetExtension(""), "las");
+    assert.equal(lidarOutputTargetExtension(undefined), "las");
+    assert.equal(lidarOutputTargetExtension(42), "las");
+  });
+});
+
+/**
+ * A minimal LAS 1.4 header (375 bytes) plus room for one VLR header.
+ *
+ * @param pointFormatByte - The point data format byte (offset 104).
+ * @param firstVlrUserId - The first VLR's user id, if any.
+ * @returns The header bytes.
+ */
+function lasHeader(pointFormatByte: number, firstVlrUserId = "", recordId = 0): Uint8Array {
+  const bytes = new Uint8Array(375 + 54);
+  const view = new DataView(bytes.buffer);
+  bytes.set([0x4c, 0x41, 0x53, 0x46], 0); // "LASF"
+  view.setUint16(94, 375, true);
+  bytes[104] = pointFormatByte;
+  bytes.set(
+    Array.from(firstVlrUserId, (char) => char.charCodeAt(0)),
+    375 + 2,
+  );
+  view.setUint16(375 + 18, recordId, true);
+  return bytes;
+}
+
+describe("lidarBytesExtension", () => {
+  it("names uncompressed LAS records .las", () => {
+    assert.equal(lidarBytesExtension(lasHeader(6, "LASF_Projection")), "las");
+  });
+
+  it("names LASzip-compressed records .laz (bit 7, or bit 6 in old files)", () => {
+    assert.equal(lidarBytesExtension(lasHeader(0x86, "laszip encoded")), "laz");
+    assert.equal(lidarBytesExtension(lasHeader(0x43)), "laz");
+  });
+
+  it("names a cloud whose first VLR is the COPC info .copc.laz", () => {
+    assert.equal(lidarBytesExtension(lasHeader(0x86, "copc", 1)), "copc.laz");
+  });
+
+  it("does not mistake a look-alike first VLR for the COPC info", () => {
+    assert.equal(lidarBytesExtension(lasHeader(0x86, "copc_custom", 1)), "laz");
+    assert.equal(lidarBytesExtension(lasHeader(0x86, "copc", 1000)), "laz");
+  });
+
+  it("falls back to .las for bytes that are not LAS", () => {
+    assert.equal(lidarBytesExtension(new Uint8Array([0x49, 0x49, 0x2a, 0x00])), "las");
+    assert.equal(lidarBytesExtension(new Uint8Array()), "las");
+  });
+});

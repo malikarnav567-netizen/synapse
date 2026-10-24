@@ -1,0 +1,36 @@
+
+> geolibre@3.4.0 dev
+> npm run dev -w geolibre-desktop
+
+
+> geolibre-desktop@3.4.0 predev
+> npm run build -w @geolibre/embed && node ../../scripts/build-jupyterlite.mjs --if-missing
+
+
+> @geolibre/embed@3.4.0 build
+> tsc -p tsconfig.build.json
+
+[build-jupyterlite] `jupyter lite` is not available — skipping the JupyterLite build. Any build that embeds the site (web, embed) will have a Notebook panel that cannot load. To enable it, install the build deps:
+  pip install -r apps/geolibre-desktop/jupyterlite/requirements.txt
+then re-run `npm run build:jupyterlite`.
+
+> geolibre-desktop@3.4.0 dev
+> vite
+
+[33m(!) Your Vite config uses features that are unsupported by `configLoader: 'native'`, which is planned to become the default in a future major version of Vite:
+  - `__dirname` (vite.config.ts:697:29). Use `import.meta.dirname` instead
+  - import "./vite-plugins/bundled-plugins" without a file extension (vite.config.ts:12:32). Add the file extension
+  - import "./vite-plugins/copy-cesium-assets" without a file extension (vite.config.ts:13:34). Add the file extension
+  - import "./vite-plugins/copy-vector-ops" without a file extension (vite.config.ts:14:31). Add the file extension
+  - import "./vite-plugins/shared-h5wasm" without a file extension (vite.config.ts:15:69). Add the file extension
+  - import "./vite-proxy-guard" without a file extension (vite.config.ts:31:8). Add the file extension
+  - import "./vite-fast-path-proxy" without a file extension (vite.config.ts:32:37). Add the file extension
+  - import "../../packages/map/src/arcgis-sdk" without a file extension (vite.config.ts:35:53). Add the file extension
+Set `VITE_CONFIG_NATIVE_IGNORE_WARNING=true` to suppress this warning.[39m
+[geolibre] assistant fast path disabled: set GEOLIBRE_AI_PROXY_TOKEN (to use the deployed Worker) or JEV_API_KEY (to call TypeSafe directly)
+
+  [32m[1mVITE[22m v8.3.2[39m  [2mready in [0m[1m1976[22m[2m[0m ms[22m
+
+  [32m➜[39m  [1mLocal[22m:   [36mhttp://127.0.0.1:[1m5173[22m/[39m
+[2m1:17:42 pm[22m [36m[1m[vite][22m[39m [90m[2m(client)[22m[39m [optimizer] scanning dependencies...
+[2m1:17:49 pm[22m [36m[1m[vite][22m[39m [90m[2m(client)[22m[39m [optimizer] bundling dependencies...

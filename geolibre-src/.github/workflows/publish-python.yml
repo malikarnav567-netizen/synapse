@@ -1,0 +1,111 @@
+name: Publish Python package
+
+on:
+  release:
+    types: [published]
+  pull_request:
+    branches: [main]
+    paths:
+      - "python/**"
+      - "apps/geolibre-desktop/src/**"
+      - "apps/geolibre-mcp-app/**"
+      - "packages/**"
+      - "scripts/build-embed.mjs"
+      - "scripts/build-mcp-app.mjs"
+      - ".github/workflows/publish-python.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: publish-python-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Test Python package
+    runs-on: ubuntu-22.04
+    timeout-minutes: 10
+    strategy:
+      matrix:
+        # Cover the declared minimum (requires-python >= 3.11) and current
+        # releases so newer-only syntax can't slip in unnoticed.
+        python-version: ["3.11", "3.12", "3.13", "3.14"]
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      # Tests cover the pure-Python builders and do not need the bundled web
+      # app, so install only the runtime/test deps and run against the sources.
+      # `mcp` (including its httpcore preview transport) and `dash` are optional
+      # extras, but tests/test_mcp_server.py skips
+      # itself without the former and test_dash_component.py only covers the
+      # missing-Dash fallback without the latter, so install both here or the
+      # MCP server and the Dash component ship untested. Likewise
+      # tests/test_pointcloud.py skips without laspy/whitebox-workflows (the
+      # `pointcloud` extra) and tests/test_spaceborne_lidar.py without h5py
+      # (the `spaceborne` extra).
+      - name: Install test dependencies
+        run: python -m pip install anywidget traitlets pytest "mcp>=2.0" "httpcore[asyncio]>=1.0.9,<2" "dash>=2.16" "laspy[lazrs]>=2.5" numpy "whitebox-workflows>=2.0.2" "h5py>=3.8"
+
+      - name: Run tests
+        run: python -m pytest python/tests
+        env:
+          PYTHONPATH: python/src
+
+  publish:
+    name: Build wheel and publish
+    runs-on: ubuntu-22.04
+    timeout-minutes: 20
+    needs: test
+    if: github.event_name == 'release'
+    environment: pypi
+    permissions:
+      contents: read
+      id-token: write # PyPI Trusted Publishing (OIDC)
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: package-lock.json
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: Install build backend
+        run: python -m pip install build
+
+      - name: Build wheel and sdist
+        working-directory: python
+        run: python -m build
+        env:
+          # Force a fresh embed build so the published wheel always carries the
+          # current app bundle.
+          GEOLIBRE_FORCE_JS_BUILD: "1"
+          NODE_OPTIONS: --max-old-space-size=4096
+          VITE_GEE_OAUTH_CLIENT_ID: ${{ secrets.VITE_GEE_OAUTH_CLIENT_ID }}
+
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # release/v1
+        with:
+          packages-dir: python/dist

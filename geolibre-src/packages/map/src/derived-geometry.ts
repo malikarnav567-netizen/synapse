@@ -1,0 +1,317 @@
+import bboxPolygon from "@turf/bbox-polygon";
+import bbox from "@turf/bbox";
+import buffer from "@turf/buffer";
+import centroid from "@turf/centroid";
+import convex from "@turf/convex";
+import mask from "@turf/mask";
+import type { Feature, FeatureCollection, MultiPolygon, Polygon } from "geojson";
+import type { GeometryGeneratorType, LayerStyle } from "@geolibre/core";
+import {
+  bodyLengthToEarth,
+  getActiveBodyRadiusRatio,
+  horizontalBbox,
+  styleValue,
+} from "@geolibre/core";
+
+/**
+ * Derived feature collections for the symbology pack (#1323): the inverted
+ * polygon mask and the per-feature geometry generator. Both are pure
+ * geometry→geometry transforms rendered through companion GeoJSON sources, so
+ * they are computed here (DOM-free, unit-testable) and memoized per source
+ * collection — syncs fire rapidly (opacity drags) and the store replaces the
+ * collection object on every data mutation, making a WeakMap the natural cache
+ * key, mirroring the deduped-label cache in layer-sync.
+ */
+
+const EMPTY: FeatureCollection = { type: "FeatureCollection", features: [] };
+
+// Bound the per-collection generator cache: buffer distances are free-typed,
+// so every distinct value would otherwise pin a full derived collection for
+// the lifetime of the source geojson object.
+const MAX_GENERATOR_CACHE_ENTRIES = 8;
+
+/**
+ * Feature-count cap for the derived-geometry transforms. mask()'s
+ * polygon-clipping union and per-feature convex/buffer all run synchronously
+ * on the main thread, so past this size the derivation is skipped (the mask
+ * falls back to the normal fill; the generator renders nothing) rather than
+ * freezing the UI for the first sync pass. Mirrors
+ * `LARGE_VECTOR_FEATURE_THRESHOLD`, the point where layers already switch
+ * render strategy.
+ */
+export const MAX_DERIVED_FEATURES = 50_000;
+
+// One cache entry per (collection, params) pair. The params key is tiny
+// (renderer type + buffer distance), so per-collection Maps stay small.
+const maskCache = new WeakMap<
+  FeatureCollection,
+  FeatureCollection<Polygon | MultiPolygon> | null
+>();
+const generatorCache = new WeakMap<FeatureCollection, Map<string, FeatureCollection>>();
+
+function polygonFeatures(collection: FeatureCollection): Feature<Polygon | MultiPolygon>[] {
+  return collection.features.filter(
+    (feature): feature is Feature<Polygon | MultiPolygon> =>
+      feature.geometry?.type === "Polygon" || feature.geometry?.type === "MultiPolygon",
+  );
+}
+
+/**
+ * Build the inverted-fill mask for a layer: one polygon covering the world
+ * with every source polygon cut out as a hole (QGIS "Inverted polygons").
+ * Returns null when the collection has no polygon features or the mask
+ * cannot be computed (e.g. invalid rings), in which case the caller renders
+ * the normal fill instead of silently dropping it.
+ *
+ * @param collection - The layer's feature collection.
+ * @returns A single-feature collection holding the mask, or null.
+ */
+export function buildInvertedMask(
+  collection: FeatureCollection,
+): FeatureCollection<Polygon | MultiPolygon> | null {
+  if (maskCache.has(collection)) return maskCache.get(collection) ?? null;
+  const result = computeInvertedMask(collection);
+  maskCache.set(collection, result);
+  return result;
+}
+
+function computeInvertedMask(
+  collection: FeatureCollection,
+): FeatureCollection<Polygon | MultiPolygon> | null {
+  if (collection.features.length > MAX_DERIVED_FEATURES) return null;
+  const polygons = polygonFeatures(collection);
+  if (polygons.length === 0) return null;
+  try {
+    // turf mask unions the features (polygon-clipping), so overlapping
+    // polygons still produce a clean even-odd-free mask.
+    const masked = mask({ type: "FeatureCollection", features: polygons });
+    return { type: "FeatureCollection", features: [masked] };
+  } catch {
+    // Degenerate rings (self-intersections the clipper rejects) must not
+    // break layer sync; the caller falls back to the normal fill.
+    return null;
+  }
+}
+
+// turf's mask is a world rectangle ([-180, -90] to [180, 90]) with every
+// feature cut out as a hole wound the same way as that rectangle. MapLibre
+// draws it as intended, but mapbox-gl drops a ring reaching the poles and draws
+// each same-wound hole as a polygon of its own, which inverts the mask (the
+// features filled, the world around them empty).
+const renderableMasks = new WeakMap<FeatureCollection, FeatureCollection<Polygon | MultiPolygon>>();
+
+/**
+ * An inverted-fill mask mapbox-gl draws the way MapLibre draws the original:
+ * the world ring pulled inside the Web Mercator latitude limit and the holes
+ * given the RFC 7946 opposing winding. Memoized per mask.
+ *
+ * @param mask - A mask from {@link buildInvertedMask}.
+ * @returns The same mask, safe for mapbox-gl.
+ */
+export function mapboxRenderableMask(
+  mask: FeatureCollection<Polygon | MultiPolygon>,
+): FeatureCollection<Polygon | MultiPolygon> {
+  const cached = renderableMasks.get(mask);
+  if (cached) return cached;
+  const winding = (ring: number[][]) => {
+    let sum = 0;
+    for (let i = 0; i < ring.length - 1; i++)
+      sum += (ring[i + 1][0] - ring[i][0]) * (ring[i + 1][1] + ring[i][1]);
+    return Math.sign(sum);
+  };
+  const maxLat = 85.0511;
+  const fix = (rings: number[][][]) =>
+    rings.map((ring, index) =>
+      index === 0
+        ? ring.map(([lng, lat]) => [lng, Math.max(-maxLat, Math.min(maxLat, lat))])
+        : winding(ring) === winding(rings[0])
+          ? [...ring].reverse()
+          : ring,
+    );
+  const result: FeatureCollection<Polygon | MultiPolygon> = {
+    ...mask,
+    features: mask.features.map((feature) =>
+      feature.geometry.type === "Polygon"
+        ? {
+            ...feature,
+            geometry: { ...feature.geometry, coordinates: fix(feature.geometry.coordinates) },
+          }
+        : {
+            ...feature,
+            geometry: { ...feature.geometry, coordinates: feature.geometry.coordinates.map(fix) },
+          },
+    ),
+  };
+  renderableMasks.set(mask, result);
+  return result;
+}
+
+/**
+ * Build the geometry generator's derived collection: one derived feature per
+ * source feature, preserving the source properties (so popups and filters
+ * keep working against the derived symbols).
+ *
+ * - `"centroid"`: a point per feature (any geometry kind).
+ * - `"bounding-box"`: the feature's axis-aligned bbox polygon.
+ * - `"convex-hull"`: the feature's convex hull (needs ≥3 distinct vertices).
+ * - `"buffer"`: a polygon buffer of `bufferDistance` meters, or of each
+ *   feature's own `bufferProperty` value when that field is set.
+ *
+ * Features whose derived geometry cannot be computed (e.g. the hull of a
+ * single point, a negative buffer that consumes the polygon) are skipped
+ * rather than failing the whole collection.
+ *
+ * @param collection - The layer's feature collection.
+ * @param type - The generator preset.
+ * @param bufferDistance - Buffer distance in meters (buffer preset only), and
+ *   the fallback for features the buffer field cannot be read from.
+ * @param bufferProperty - Attribute holding a per-feature buffer distance in
+ *   meters; empty buffers every feature by `bufferDistance`.
+ * @returns The derived collection (possibly empty), or null when the
+ *   generator is `"none"`.
+ */
+export function buildGeneratedGeometry(
+  collection: FeatureCollection,
+  type: GeometryGeneratorType,
+  bufferDistance: number,
+  bufferProperty = "",
+): FeatureCollection | null {
+  if (type === "none") return null;
+  if (collection.features.length > MAX_DERIVED_FEATURES) return EMPTY;
+  const distance = type === "buffer" && Number.isFinite(bufferDistance) ? bufferDistance : 0;
+  const property = type === "buffer" ? bufferProperty.trim() : "";
+  // A zero flat distance buffers nothing — unless a field supplies the real
+  // distances, in which case it is only the fallback for unreadable values.
+  if (type === "buffer" && distance === 0 && !property) return EMPTY;
+  // The body's radius ratio is part of the buffer's identity: switching planets
+  // changes the ground distance those metres cover, so it must not hit a cache
+  // entry computed for the previous body.
+  const key =
+    type === "buffer" ? `buffer:${distance}:${property}:${getActiveBodyRadiusRatio()}` : type;
+  let byKey = generatorCache.get(collection);
+  if (!byKey) {
+    byKey = new Map();
+    generatorCache.set(collection, byKey);
+  }
+  const cached = byKey.get(key);
+  if (cached) return cached;
+  const result = computeGeneratedGeometry(collection, type, distance, property);
+  // The buffer key space is user-typed and unbounded, so cap the
+  // per-collection cache (oldest evicted first) — unlike the sibling caches
+  // whose key cardinality is naturally small.
+  if (byKey.size >= MAX_GENERATOR_CACHE_ENTRIES) {
+    const oldest = byKey.keys().next().value;
+    if (oldest !== undefined) byKey.delete(oldest);
+  }
+  byKey.set(key, result);
+  return result;
+}
+
+function computeGeneratedGeometry(
+  collection: FeatureCollection,
+  type: Exclude<GeometryGeneratorType, "none">,
+  bufferDistance: number,
+  bufferProperty: string,
+): FeatureCollection {
+  const features: Feature[] = [];
+  for (const feature of collection.features) {
+    if (!feature.geometry) continue;
+    const distance = bufferProperty
+      ? featureBufferDistance(feature, bufferProperty, bufferDistance)
+      : bufferDistance;
+    const derived = deriveFeature(feature, type, distance);
+    if (derived) {
+      features.push({
+        type: "Feature",
+        properties: feature.properties ?? {},
+        geometry: derived.geometry,
+      });
+    }
+  }
+  return { type: "FeatureCollection", features };
+}
+
+/**
+ * The buffer distance for one feature in data-defined mode: its own numeric
+ * value for `property`, falling back to the flat distance when the attribute
+ * is missing, null, blank, or not a number. Mirrors QGIS, where a
+ * data-defined override that evaluates to NULL leaves the static value in
+ * place rather than dropping the symbol.
+ */
+function featureBufferDistance(feature: Feature, property: string, fallback: number): number {
+  const raw = feature.properties?.[property];
+  if (typeof raw === "number") return Number.isFinite(raw) ? raw : fallback;
+  // Number("") and Number(" ") are both 0 (it trims first), so a blank
+  // attribute would otherwise read as a real zero-distance buffer — which
+  // drops the feature — instead of as a miss.
+  // Only strings are coerced: Number() turns `true` into a 1 m buffer and
+  // `[1000]` into a 1 km one, and those are no more a distance than a name is.
+  if (typeof raw !== "string" || raw.trim() === "") return fallback;
+  const value = Number(raw);
+  return Number.isFinite(value) ? value : fallback;
+}
+
+function deriveFeature(
+  feature: Feature,
+  type: Exclude<GeometryGeneratorType, "none">,
+  bufferDistance: number,
+): Feature | null {
+  try {
+    switch (type) {
+      case "centroid":
+        return centroid(feature);
+      case "bounding-box": {
+        // A six-element box carries elevation, so reduce it to the 2D corners
+        // the degenerate check and bboxPolygon() expect.
+        const box2d = horizontalBbox(bbox(feature));
+        if (!box2d) return null;
+        // A point's bbox is degenerate (zero area) and would render nothing.
+        if (box2d[0] === box2d[2] && box2d[1] === box2d[3]) return null;
+        return bboxPolygon(box2d);
+      }
+      case "convex-hull":
+        return convex({ type: "FeatureCollection", features: [feature] });
+      case "buffer":
+        // In data-defined mode the collection-wide zero guard no longer
+        // applies, and turf's zero buffer returns the source geometry — which
+        // would draw the untouched feature as if it were its own buffer.
+        if (bufferDistance === 0) return null;
+        // turf bakes in Earth's radius, so on a Moon/Mars project the metres
+        // the user asked for would be laid out as Earth metres. Convert to the
+        // Earth-equivalent distance that spans the same ground on this body
+        // (GeoLibre#1128); a no-op on Earth.
+        return buffer(feature, bodyLengthToEarth(bufferDistance), { units: "meters" }) ?? null;
+    }
+  } catch {
+    // Per-feature failures (invalid geometry) skip that feature only.
+    return null;
+  }
+}
+
+/**
+ * The geometry kinds present in a generated collection, used by layer sync to
+ * decide which companion render layers (fill/line vs circle) to create.
+ */
+export function generatedGeometryKinds(collection: FeatureCollection): {
+  hasPoint: boolean;
+  hasPolygon: boolean;
+} {
+  let hasPoint = false;
+  let hasPolygon = false;
+  for (const feature of collection.features) {
+    const kind = feature.geometry?.type;
+    if (kind === "Point" || kind === "MultiPoint") hasPoint = true;
+    if (kind === "Polygon" || kind === "MultiPolygon") hasPolygon = true;
+    if (hasPoint && hasPolygon) break;
+  }
+  return { hasPoint, hasPolygon };
+}
+
+/**
+ * Resolve the decoration color: an unset (empty) color inherits the stroke
+ * color so decorations follow the line by default.
+ */
+export function lineDecorationColorValue(style: LayerStyle): string {
+  const color = styleValue(style, "lineDecorationColor").trim();
+  return color || styleValue(style, "strokeColor");
+}

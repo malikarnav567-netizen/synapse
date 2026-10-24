@@ -1,0 +1,714 @@
+import {
+  createDefaultMapView,
+  isAllowedPluginManifestUrl,
+  normalizeMapViewState,
+  normalizeLayerStyleEntries,
+  normalizeLayersFileContent,
+  type LayerGroup,
+  type GeoLibreLayer,
+  type LayerStyleFileEntry,
+} from "@geolibre/core";
+import { useEffect } from "react";
+import { create } from "zustand";
+import { normalizeStringList } from "../lib/string-lists";
+import { DESKTOP_SETTINGS_STORAGE_KEY } from "../lib/storage-keys";
+import {
+  credentialStorageLocation,
+  queueCredentialChanges,
+  reportCredentialStorageError,
+} from "../lib/credential-store";
+import {
+  mergeDesktopSettingsSecrets,
+  splitDesktopSettingsSecrets,
+} from "../lib/desktop-settings-secrets";
+import {
+  DEFAULT_CUSTOM_COLOR,
+  DEFAULT_THEME_SCHEME,
+  isHexColor,
+  isThemeScheme,
+  type ThemeScheme,
+} from "../lib/theme-schemes";
+import type { UpdateNotificationLevel } from "../lib/updates";
+import { migrateLegacyAiEnv } from "../lib/assistant/profiles";
+import {
+  normalizeS3Connections,
+  normalizeS3DefaultLocation,
+  type S3Connection,
+} from "../lib/s3-connections";
+import { ASSISTANT_PROVIDER_IDS } from "../lib/assistant/provider";
+import type { AssistantProfile } from "../lib/assistant/provider";
+
+/** Notification-granularity options, in order. Single source of truth. */
+export const UPDATE_NOTIFICATION_LEVELS: readonly UpdateNotificationLevel[] = [
+  "all",
+  "minor",
+  "major",
+];
+
+export interface DesktopSettings {
+  additionalPluginDirectories: string[];
+  /**
+   * Persisted UI language code (e.g. `"en"`, `"zh"`). Empty string means "follow
+   * automatic detection" (browser/default). The i18n layer reads this directly
+   * from localStorage on startup; a `?locale`/`?lang` query param overrides it
+   * for embeds. See `src/i18n/index.ts`.
+   */
+  language: string;
+  layout: DesktopLayoutSettings;
+  pluginManifestUrls: string[];
+  /**
+   * Ids of external plugins whose top-level toolbar menus the user moved out of
+   * the banner (GeoLibre#2850). Such a menu renders inside the plugin's entry in
+   * Plugins → Installed instead. Device-local, like the rest of the plugin
+   * settings.
+   */
+  foldedPluginMenus: string[];
+  /**
+   * Personal API token for uploading projects to share.geolibre.app. The
+   * desktop build keeps it in the OS credential store (see
+   * `lib/credential-store.ts`) and writes only an empty string into this
+   * localStorage blob. The web build keeps it in this blob, where any
+   * same-origin script could read it: the well-understood "PAT in local
+   * storage" trade-off for a short-lived, revocable, single-service token.
+   */
+  shareToken: string;
+  /**
+   * Cesium Ion access token for the 3D-globe view (Cesium World Imagery +
+   * Terrain need one). Device-local, not the shared project file, so a personal
+   * credential is never serialized into a `.geolibre.json` a user shares.
+   * Projected into `VITE_CESIUM_TOKEN` at runtime by
+   * `useRuntimeEnvironmentVariables`, and resolved through `getCesiumIonToken`,
+   * so it overrides the build-time token with no rebuild. Stored like
+   * {@link shareToken}: OS credential store on desktop, this blob on the web.
+   */
+  cesiumIonToken: string;
+  /** Device-local Mapbox access token, excluded from shared project files. Stored like {@link shareToken}. */
+  mapboxAccessToken: string;
+  /**
+   * Device-local ArcGIS API key for the ArcGIS renderer, excluded from shared
+   * project files. Stored like {@link shareToken}.
+   */
+  arcgisApiKey: string;
+  /**
+   * AI Assistant provider profiles. Each profile bundles a provider, model, and
+   * credential values. Device-local, not the shared project file, so personal
+   * API keys survive app restarts yet are never serialized into a
+   * `.geolibre.json` a user shares. On desktop the secret `fieldValues` (see
+   * `PROVIDER_FIELDS`) live in the OS credential store; on the web they stay in
+   * this blob.
+   */
+  aiProfiles: AssistantProfile[];
+  /**
+   * The id of the default / active profile, or null. When set, this profile's
+   * credentials are projected into the runtime env and the assistant panel
+   * preselects it. Persisted separately to localStorage so the active choice
+   * survives settings dialog Cancel without extra plumbing.
+   */
+  defaultAiProfileId: string | null;
+  /**
+   * S3 (and S3-compatible) connections used to read private buckets, matched
+   * by bucket name. Device-local, never in a project file. The secret key and
+   * session token of an access-key connection live in the OS credential store
+   * on desktop and in this blob on the web.
+   */
+  s3Connections: S3Connection[];
+  /**
+   * Where the S3 Browser opens (`s3://bucket/prefix/`), or "" for the last
+   * location browsed. Device-local like the connections.
+   */
+  s3DefaultLocation: string;
+  /**
+   * Appearance preferences (the accent color scheme). The light/dark mode is
+   * handled separately by `useThemeMode` (it tracks the OS / embed preference).
+   */
+  theme: ThemeSettings;
+  /**
+   * Customizable UI profile: which data sources / web services / plugins are
+   * visible, an optional experience-level preset, first-launch onboarding state,
+   * and an admin lock. See `src/lib/ui-profile.ts` and `docs/ui-profiles.md`.
+   */
+  uiProfile: UiProfileSettings;
+  /**
+   * Automated software-update preferences. The startup check only runs in the
+   * desktop (Tauri) build; on the web these settings are inert.
+   */
+  updates: UpdateSettings;
+  /** Native-app project restoration policy. Browser builds ignore this setting. */
+  startup: StartupSettings;
+}
+
+export type StartupProjectMode = "default" | "last" | "specific";
+
+export interface StartupSettings {
+  mode: StartupProjectMode;
+  projectPath: string | null;
+  projectName: string | null;
+  /** Projection used when startup does not restore or receive a project. */
+  globeByDefault: boolean;
+  /** Center used for the untitled workspace when no project is provided. */
+  center: [number, number];
+  /** Zoom used for the untitled workspace when no project is provided. */
+  zoom: number;
+  /**
+   * Layer styles file whose styles are applied, by layer name, to every layer
+   * added to the map. Null when none is set.
+   */
+  layerStyles: StartupLayerStyles | null;
+  /**
+   * Layers file whose layers are added to every untitled workspace: the one
+   * shown at launch and each File → New. Null when none is set.
+   */
+  layers: StartupLayers | null;
+  /** Open the S3 Browser panel when the app starts (not in the read-only viewer). */
+  openS3Browser: boolean;
+}
+
+/**
+ * The layer styles file chosen in Startup settings. The parsed styles are
+ * kept here rather than re-read from `path` on each launch: the browser build
+ * never gets a readable path back from its picker, and on desktop the file may
+ * have moved. Choosing the file again picks up later edits to it.
+ */
+export interface StartupLayerStyles {
+  /** The file's name, for display. */
+  fileName: string;
+  /** The path (desktop) or file name (browser) it was read from. */
+  path: string;
+  entries: LayerStyleFileEntry[];
+}
+
+/**
+ * The layers file chosen in Startup settings, kept parsed for the same reasons
+ * as {@link StartupLayerStyles}. Its layers only reference their data, so the
+ * copy stays small.
+ */
+export interface StartupLayers {
+  /** The file's name, for display. */
+  fileName: string;
+  /** The path (desktop) or file name (browser) it was read from. */
+  path: string;
+  layers: GeoLibreLayer[];
+  layerGroups: LayerGroup[];
+}
+
+export interface ThemeSettings {
+  /** Accent color scheme. Presets set a `data-theme` attribute on <html>. */
+  scheme: ThemeScheme;
+  /** Hex color backing the "custom" scheme (ignored by the presets). */
+  customColor: string;
+}
+
+export interface UpdateSettings {
+  /** Whether to check for a newer version each time the desktop app starts. */
+  checkOnStartup: boolean;
+  /** Which kinds of releases raise a startup notification. */
+  notificationLevel: UpdateNotificationLevel;
+}
+
+export interface DesktopLayoutSettings {
+  /**
+   * Whether the Browser (Data Source Manager) right panel is registered as
+   * visible. Unlike {@link layerPanelVisible} this does not describe a fixed
+   * dock slot: the Browser is a dockable right panel, so the flag is the
+   * persisted seed its registration hook applies on mount (open + collapsed onto
+   * its rail, or closed). Without it the panel reopened on every launch no
+   * matter what the Settings toggle said (#1935).
+   */
+  browserPanelVisible: boolean;
+  /** Same as {@link browserPanelVisible}, for the Comments right panel. */
+  commentsPanelVisible: boolean;
+  /**
+   * Compact Layers panel: each row shows only its visibility toggle, swatch,
+   * and name, and the opacity slider and action buttons appear on the selected
+   * row alone. Keeps a project with hundreds of layers (e.g. a KMZ of
+   * placemarks) scannable, like the Places tree in Google Earth (#3045).
+   */
+  compactLayerList: boolean;
+  layerPanelVisible: boolean;
+  showProjectInfo: boolean;
+  stylePanelVisible: boolean;
+  toolbarLabels: boolean;
+}
+
+/** Experience-level presets offered by the onboarding wizard and Settings. */
+export type ExperienceLevel = "beginner" | "intermediate" | "advanced";
+
+export interface UiProfileSettings {
+  /**
+   * When false, every data source and plugin is visible regardless of the hidden
+   * lists below. This is the back-compat default so existing users see no change
+   * until they opt in via onboarding, the Settings dialog, or an admin file.
+   */
+  enabled: boolean;
+  /**
+   * The experience-level preset last applied, or null for a custom selection
+   * (the user manually toggled an item). Only used to highlight the active preset.
+   */
+  level: ExperienceLevel | null;
+  /** Whether the first-launch onboarding wizard has been completed or dismissed. */
+  onboarded: boolean;
+  /**
+   * Set by an admin config file (`docs/ui-profiles.md`). When true the profile is
+   * managed centrally and the Settings controls are disabled.
+   */
+  locked: boolean;
+  /** Data-source catalog ids hidden from the Add Data menu. */
+  hiddenDataSources: string[];
+  /** Plugin ids hidden from the Plugins menu. */
+  hiddenPlugins: string[];
+  /** Top-level toolbar menu ids hidden entirely (e.g. `processing`, `help`). */
+  hiddenMenus: string[];
+  /**
+   * Menu-item catalog ids hidden from their menu (Project/Edit/Processing/
+   * Controls/Settings/Help). Add Data and Plugins use the two lists above.
+   */
+  hiddenMenuItems: string[];
+}
+
+interface DesktopSettingsState {
+  desktopSettings: DesktopSettings;
+  setDesktopSettings: (settings: DesktopSettings) => void;
+}
+
+let desktopSettingsAreTemporary = false;
+/**
+ * Legacy plaintext credentials whose migration into the OS credential store
+ * failed this session. They are written back into the blob unchanged, so a
+ * failed migration never loses them, and the next launch retries.
+ */
+let preservedLegacyCredentialSecrets: Record<string, string> | null = null;
+/**
+ * False after a failed settings hydration: edits then stay in memory, so new
+ * keychain writes never interleave with unmigrated legacy credentials.
+ */
+let settingsKeychainWritable = true;
+
+export function setPreservedLegacyCredentialSecrets(secrets: Record<string, string> | null): void {
+  preservedLegacyCredentialSecrets = secrets;
+}
+
+export function setSettingsKeychainWritable(writable: boolean): void {
+  settingsKeychainWritable = writable;
+}
+
+export const DEFAULT_DESKTOP_LAYOUT_SETTINGS: DesktopLayoutSettings = {
+  browserPanelVisible: true,
+  commentsPanelVisible: true,
+  compactLayerList: false,
+  layerPanelVisible: true,
+  showProjectInfo: true,
+  stylePanelVisible: true,
+  toolbarLabels: true,
+};
+
+export const DEFAULT_UI_PROFILE_SETTINGS: UiProfileSettings = {
+  // Ship the Advanced interface by default (`enabled: false` shows every item,
+  // which `activeInterfaceProfile` reports as "advanced") and skip the
+  // first-launch welcome dialog (`onboarded: true`). Users can still switch to a
+  // curated preset from the Settings dialog.
+  enabled: false,
+  level: null,
+  onboarded: true,
+  locked: false,
+  hiddenDataSources: [],
+  hiddenPlugins: [],
+  hiddenMenus: [],
+  hiddenMenuItems: [],
+};
+
+export const DEFAULT_UPDATE_SETTINGS: UpdateSettings = {
+  checkOnStartup: true,
+  notificationLevel: "all",
+};
+
+export const DEFAULT_STARTUP_SETTINGS: StartupSettings = {
+  mode: "default",
+  projectPath: null,
+  projectName: null,
+  globeByDefault: true,
+  center: [...createDefaultMapView().center],
+  zoom: createDefaultMapView().zoom,
+  layerStyles: null,
+  layers: null,
+  openS3Browser: false,
+};
+
+export const DEFAULT_THEME_SETTINGS: ThemeSettings = {
+  scheme: DEFAULT_THEME_SCHEME,
+  customColor: DEFAULT_CUSTOM_COLOR,
+};
+
+const DEFAULT_DESKTOP_SETTINGS: DesktopSettings = {
+  additionalPluginDirectories: [],
+  language: "",
+  layout: DEFAULT_DESKTOP_LAYOUT_SETTINGS,
+  pluginManifestUrls: [],
+  foldedPluginMenus: [],
+  shareToken: "",
+  cesiumIonToken: "",
+  mapboxAccessToken: "",
+  arcgisApiKey: "",
+  aiProfiles: [],
+  defaultAiProfileId: null,
+  s3Connections: [],
+  s3DefaultLocation: "",
+  theme: DEFAULT_THEME_SETTINGS,
+  uiProfile: DEFAULT_UI_PROFILE_SETTINGS,
+  updates: DEFAULT_UPDATE_SETTINGS,
+  startup: DEFAULT_STARTUP_SETTINGS,
+};
+
+/** The experience-level presets, in order. Single source of truth. */
+export const EXPERIENCE_LEVELS: readonly ExperienceLevel[] = [
+  "beginner",
+  "intermediate",
+  "advanced",
+];
+
+export function normalizeDesktopSettings(settings: unknown): DesktopSettings {
+  if (!settings || typeof settings !== "object") {
+    return DEFAULT_DESKTOP_SETTINGS;
+  }
+
+  const candidate = settings as Partial<DesktopSettings>;
+  return {
+    additionalPluginDirectories: normalizeStringList(candidate.additionalPluginDirectories),
+    language: typeof candidate.language === "string" ? candidate.language.trim() : "",
+    layout: normalizeDesktopLayoutSettings(candidate.layout),
+    // Apply the same scheme rule as project-file loading so stale or edited
+    // localStorage values cannot smuggle in disallowed URL schemes.
+    pluginManifestUrls: normalizeStringList(candidate.pluginManifestUrls).filter(
+      isAllowedPluginManifestUrl,
+    ),
+    foldedPluginMenus: normalizeStringList(candidate.foldedPluginMenus),
+    shareToken: typeof candidate.shareToken === "string" ? candidate.shareToken.trim() : "",
+    mapboxAccessToken:
+      typeof candidate.mapboxAccessToken === "string" ? candidate.mapboxAccessToken.trim() : "",
+    arcgisApiKey: typeof candidate.arcgisApiKey === "string" ? candidate.arcgisApiKey.trim() : "",
+    cesiumIonToken:
+      typeof candidate.cesiumIonToken === "string" ? candidate.cesiumIonToken.trim() : "",
+    aiProfiles: normalizeAssistantProfiles(
+      candidate.aiProfiles,
+      (candidate as Record<string, unknown>).aiProviderEnv,
+    ),
+    defaultAiProfileId:
+      typeof candidate.defaultAiProfileId === "string" && candidate.defaultAiProfileId.trim()
+        ? candidate.defaultAiProfileId.trim()
+        : null,
+    s3Connections: normalizeS3Connections(candidate.s3Connections),
+    s3DefaultLocation: normalizeS3DefaultLocation(candidate.s3DefaultLocation),
+    theme: normalizeThemeSettings(candidate.theme),
+    uiProfile: normalizeUiProfileSettings(candidate.uiProfile),
+    updates: normalizeUpdateSettings(candidate.updates),
+    startup: normalizeStartupSettings(candidate.startup),
+  };
+}
+
+function normalizeStartupSettings(startup: unknown): StartupSettings {
+  if (!startup || typeof startup !== "object") return DEFAULT_STARTUP_SETTINGS;
+  const candidate = startup as Partial<StartupSettings>;
+  const view = normalizeMapViewState({
+    center: candidate.center,
+    zoom: candidate.zoom,
+    bearing: 0,
+    pitch: 0,
+  });
+  const mode: StartupProjectMode =
+    candidate.mode === "last" || candidate.mode === "specific" ? candidate.mode : "default";
+  const projectPath =
+    typeof candidate.projectPath === "string" && candidate.projectPath.trim()
+      ? candidate.projectPath.trim()
+      : null;
+  const projectName =
+    typeof candidate.projectName === "string" && candidate.projectName.trim()
+      ? candidate.projectName.trim()
+      : null;
+  return {
+    mode: mode === "specific" && !projectPath ? "default" : mode,
+    projectPath,
+    projectName,
+    globeByDefault: typeof candidate.globeByDefault === "boolean" ? candidate.globeByDefault : true,
+    center: view.center,
+    zoom: view.zoom,
+    layerStyles: normalizeStartupLayerStyles(candidate.layerStyles),
+    layers: normalizeStartupLayers(candidate.layers),
+    openS3Browser: candidate.openS3Browser === true,
+  };
+}
+
+function normalizeStartupLayerStyles(value: unknown): StartupLayerStyles | null {
+  if (!value || typeof value !== "object") return null;
+  const candidate = value as Partial<Record<keyof StartupLayerStyles, unknown>>;
+  const entries = normalizeLayerStyleEntries(candidate.entries);
+  if (entries.length === 0) return null;
+  const path = typeof candidate.path === "string" ? candidate.path : "";
+  const fileName =
+    typeof candidate.fileName === "string" && candidate.fileName.trim()
+      ? candidate.fileName.trim()
+      : path;
+  return { fileName, path, entries };
+}
+
+function normalizeStartupLayers(value: unknown): StartupLayers | null {
+  if (!value || typeof value !== "object") return null;
+  const candidate = value as Partial<Record<keyof StartupLayers, unknown>>;
+  const content = normalizeLayersFileContent(candidate);
+  if (content.layers.length === 0) return null;
+  const path = typeof candidate.path === "string" ? candidate.path : "";
+  const fileName =
+    typeof candidate.fileName === "string" && candidate.fileName.trim()
+      ? candidate.fileName.trim()
+      : path;
+  return { fileName, path, ...content };
+}
+
+/**
+ * Coerce a persisted (or tampered) profiles array into a clean form. Each
+ * profile must have valid fields matching its provider's schema. The legacy
+ * `aiProviderEnv` flat map is migrated into profiles on first load.
+ */
+function normalizeAssistantProfiles(value: unknown, legacyEnv: unknown): AssistantProfile[] {
+  const profiles: AssistantProfile[] = [];
+
+  if (Array.isArray(value)) {
+    const seenIds = new Set<string>();
+    for (const item of value) {
+      if (!item || typeof item !== "object") continue;
+      const candidate = item as Record<string, unknown>;
+      const id =
+        typeof candidate.id === "string" && candidate.id.trim()
+          ? candidate.id.trim()
+          : `prof_auto_${profiles.length}_${Date.now()}`;
+      // Deduplicate by id.
+      if (seenIds.has(id)) continue;
+      seenIds.add(id);
+
+      const name =
+        typeof candidate.name === "string" && candidate.name.trim()
+          ? candidate.name.trim()
+          : `Profile ${profiles.length + 1}`;
+      const provider =
+        typeof candidate.provider === "string" &&
+        ASSISTANT_PROVIDER_IDS.includes(candidate.provider as AssistantProfile["provider"])
+          ? (candidate.provider as AssistantProfile["provider"])
+          : "google";
+      const modelId =
+        typeof candidate.modelId === "string" && candidate.modelId.trim()
+          ? candidate.modelId.trim()
+          : "";
+      const fieldValues: Record<string, string> = {};
+      if (
+        candidate.fieldValues &&
+        typeof candidate.fieldValues === "object" &&
+        !Array.isArray(candidate.fieldValues)
+      ) {
+        for (const [k, v] of Object.entries(candidate.fieldValues)) {
+          const key = k.trim();
+          if (key && typeof v === "string" && v.trim()) {
+            fieldValues[key] = v.trim();
+          }
+        }
+      }
+
+      profiles.push({ id, name, provider, modelId, fieldValues });
+    }
+  }
+
+  // Migrate legacy flat env map into profiles (dedup against existing).
+  if (legacyEnv && typeof legacyEnv === "object" && !Array.isArray(legacyEnv)) {
+    const migrated = migrateLegacyAiEnv(legacyEnv as Record<string, string>, profiles);
+    profiles.push(...migrated);
+  }
+
+  return profiles;
+}
+
+function normalizeThemeSettings(theme: unknown): ThemeSettings {
+  if (!theme || typeof theme !== "object") {
+    return DEFAULT_THEME_SETTINGS;
+  }
+
+  // Require a known scheme id and a valid hex color so tampered localStorage
+  // values cannot smuggle an unknown scheme into the `data-theme` attribute or an
+  // arbitrary string into the inline custom-color tokens.
+  const candidate = theme as Partial<ThemeSettings>;
+  return {
+    scheme: isThemeScheme(candidate.scheme) ? candidate.scheme : DEFAULT_THEME_SETTINGS.scheme,
+    // Normalize so the value bound to `<input type="color">` is exactly
+    // `#rrggbb` lowercase (isHexColor already requires the leading `#`).
+    customColor: isHexColor(candidate.customColor)
+      ? candidate.customColor.trim().toLowerCase()
+      : DEFAULT_THEME_SETTINGS.customColor,
+  };
+}
+
+function normalizeUpdateSettings(updates: unknown): UpdateSettings {
+  if (!updates || typeof updates !== "object") {
+    return DEFAULT_UPDATE_SETTINGS;
+  }
+
+  // Require a strict boolean and a known level so tampered localStorage values
+  // cannot smuggle non-boolean / unknown values into the update settings.
+  const candidate = updates as Partial<UpdateSettings>;
+  return {
+    checkOnStartup:
+      typeof candidate.checkOnStartup === "boolean"
+        ? candidate.checkOnStartup
+        : DEFAULT_UPDATE_SETTINGS.checkOnStartup,
+    notificationLevel:
+      typeof candidate.notificationLevel === "string" &&
+      UPDATE_NOTIFICATION_LEVELS.includes(candidate.notificationLevel as UpdateNotificationLevel)
+        ? (candidate.notificationLevel as UpdateNotificationLevel)
+        : DEFAULT_UPDATE_SETTINGS.notificationLevel,
+  };
+}
+
+function normalizeUiProfileSettings(profile: unknown): UiProfileSettings {
+  if (!profile || typeof profile !== "object") {
+    return DEFAULT_UI_PROFILE_SETTINGS;
+  }
+
+  // Require strict booleans and a known level so tampered localStorage values
+  // cannot smuggle non-boolean / unknown values into the profile.
+  const candidate = profile as Partial<UiProfileSettings>;
+  return {
+    enabled:
+      typeof candidate.enabled === "boolean"
+        ? candidate.enabled
+        : DEFAULT_UI_PROFILE_SETTINGS.enabled,
+    level:
+      typeof candidate.level === "string" &&
+      EXPERIENCE_LEVELS.includes(candidate.level as ExperienceLevel)
+        ? (candidate.level as ExperienceLevel)
+        : null,
+    onboarded:
+      typeof candidate.onboarded === "boolean"
+        ? candidate.onboarded
+        : DEFAULT_UI_PROFILE_SETTINGS.onboarded,
+    locked:
+      typeof candidate.locked === "boolean" ? candidate.locked : DEFAULT_UI_PROFILE_SETTINGS.locked,
+    hiddenDataSources: normalizeStringList(candidate.hiddenDataSources),
+    hiddenPlugins: normalizeStringList(candidate.hiddenPlugins),
+    hiddenMenus: normalizeStringList(candidate.hiddenMenus),
+    hiddenMenuItems: normalizeStringList(candidate.hiddenMenuItems),
+  };
+}
+
+function normalizeDesktopLayoutSettings(layout: unknown): DesktopLayoutSettings {
+  if (!layout || typeof layout !== "object") {
+    return DEFAULT_DESKTOP_LAYOUT_SETTINGS;
+  }
+
+  // Require strict booleans so tampered localStorage values (e.g. "yes")
+  // cannot smuggle non-boolean values into the layout settings.
+  const candidate = layout as Partial<DesktopLayoutSettings>;
+  return {
+    browserPanelVisible:
+      typeof candidate.browserPanelVisible === "boolean"
+        ? candidate.browserPanelVisible
+        : DEFAULT_DESKTOP_LAYOUT_SETTINGS.browserPanelVisible,
+    commentsPanelVisible:
+      typeof candidate.commentsPanelVisible === "boolean"
+        ? candidate.commentsPanelVisible
+        : DEFAULT_DESKTOP_LAYOUT_SETTINGS.commentsPanelVisible,
+    compactLayerList:
+      typeof candidate.compactLayerList === "boolean"
+        ? candidate.compactLayerList
+        : DEFAULT_DESKTOP_LAYOUT_SETTINGS.compactLayerList,
+    layerPanelVisible:
+      typeof candidate.layerPanelVisible === "boolean"
+        ? candidate.layerPanelVisible
+        : DEFAULT_DESKTOP_LAYOUT_SETTINGS.layerPanelVisible,
+    showProjectInfo:
+      typeof candidate.showProjectInfo === "boolean"
+        ? candidate.showProjectInfo
+        : DEFAULT_DESKTOP_LAYOUT_SETTINGS.showProjectInfo,
+    stylePanelVisible:
+      typeof candidate.stylePanelVisible === "boolean"
+        ? candidate.stylePanelVisible
+        : DEFAULT_DESKTOP_LAYOUT_SETTINGS.stylePanelVisible,
+    toolbarLabels:
+      typeof candidate.toolbarLabels === "boolean"
+        ? candidate.toolbarLabels
+        : DEFAULT_DESKTOP_LAYOUT_SETTINGS.toolbarLabels,
+  };
+}
+
+function loadDesktopSettings(): DesktopSettings {
+  if (typeof window === "undefined") return DEFAULT_DESKTOP_SETTINGS;
+
+  try {
+    const stored = window.localStorage.getItem(DESKTOP_SETTINGS_STORAGE_KEY);
+    if (!stored) return DEFAULT_DESKTOP_SETTINGS;
+    return normalizeDesktopSettings(JSON.parse(stored) as unknown);
+  } catch {
+    return DEFAULT_DESKTOP_SETTINGS;
+  }
+}
+
+/**
+ * The localStorage form of `settings`. On desktop the credentials are stripped
+ * (they live in the OS credential store), except legacy values whose migration
+ * failed this session.
+ */
+export function serializeDesktopSettingsForStorage(settings: DesktopSettings): string {
+  if (credentialStorageLocation() === "browser") return JSON.stringify(settings);
+  const { publicSettings } = splitDesktopSettingsSecrets(settings);
+  return JSON.stringify(
+    preservedLegacyCredentialSecrets
+      ? mergeDesktopSettingsSecrets(publicSettings, preservedLegacyCredentialSecrets)
+      : publicSettings,
+  );
+}
+
+function saveDesktopSettings(settings: DesktopSettings): void {
+  if (typeof window === "undefined") return;
+
+  try {
+    window.localStorage.setItem(
+      DESKTOP_SETTINGS_STORAGE_KEY,
+      serializeDesktopSettingsForStorage(settings),
+    );
+  } catch (error) {
+    // Web persistence is best-effort (quota or disabled storage). On desktop a
+    // failed write can leave legacy plaintext credentials behind, so say so.
+    if (credentialStorageLocation() === "keychain") reportCredentialStorageError(error);
+  }
+}
+
+export const useDesktopSettingsStore = create<DesktopSettingsState>((set) => ({
+  desktopSettings: loadDesktopSettings(),
+  setDesktopSettings: (settings) => set({ desktopSettings: normalizeDesktopSettings(settings) }),
+}));
+
+/** Apply settings supplied by an embed URL without replacing this browser's saved preferences. */
+export function applyTemporaryDesktopSettings(settings: unknown): void {
+  desktopSettingsAreTemporary = true;
+  useDesktopSettingsStore.getState().setDesktopSettings(normalizeDesktopSettings(settings));
+}
+
+export function shouldPersistDesktopSettings(): boolean {
+  return !desktopSettingsAreTemporary;
+}
+
+export function useDesktopSettingsPersistence() {
+  useEffect(() => {
+    // Keep the entire shared-settings session ephemeral. Persisting a later
+    // user edit would serialize the remote baseline along with that edit and
+    // silently replace unrelated local preferences.
+    if (!shouldPersistDesktopSettings()) return;
+    saveDesktopSettings(useDesktopSettingsStore.getState().desktopSettings);
+
+    return useDesktopSettingsStore.subscribe((state, previous) => {
+      if (state.desktopSettings !== previous.desktopSettings) {
+        saveDesktopSettings(state.desktopSettings);
+        if (credentialStorageLocation() === "keychain" && settingsKeychainWritable) {
+          void queueCredentialChanges(
+            splitDesktopSettingsSecrets(previous.desktopSettings).secrets,
+            splitDesktopSettingsSecrets(state.desktopSettings).secrets,
+          );
+        }
+      }
+    });
+  }, []);
+}

@@ -1,0 +1,580 @@
+import assert from "node:assert/strict";
+import { describe, it } from "node:test";
+import type { GeoLibreLayer } from "@geolibre/core";
+import type { FeatureCollection } from "geojson";
+import { GEBCO_ATTRIBUTION } from "../apps/geolibre-desktop/src/components/layout/add-data/constants";
+import {
+  applyServiceEntry,
+  arcgisFieldsToOptions,
+  buildWfsGeoJsonLayer,
+  buildWmsLayer,
+  buildWmtsLayer,
+  buildXyzLayer,
+  wfsFieldsToRequest,
+  wmsFieldsToParams,
+  wmtsFieldsToParams,
+  xyzFieldsToRequest,
+} from "../apps/geolibre-desktop/src/components/layout/add-data/apply-service";
+import type {
+  ServiceFields,
+  ServiceLibraryEntry,
+  ServiceLibraryKind,
+} from "../apps/geolibre-desktop/src/components/layout/add-data/service-library";
+
+/** Builds a service-library entry for a test with the given kind and fields. */
+function entry(
+  kind: ServiceLibraryKind,
+  fields: ServiceFields,
+  name = "Test service",
+): ServiceLibraryEntry {
+  return { id: "test-id", name, category: "", kind, fields };
+}
+
+describe("buildXyzLayer", () => {
+  it("builds a raster XYZ layer with the rendered tile URL", () => {
+    const layer = buildXyzLayer({
+      name: "Imagery",
+      tileUrl: {
+        originalUrl: "https://x/{z}/{x}/{y}.png",
+        renderUrl: "https://x/{z}/{x}/{y}.png",
+        url: "https://x/{z}/{x}/{y}.png",
+        redirected: false,
+      },
+      tileSize: "256",
+      shortUrl: false,
+    });
+    assert.equal(layer.type, "xyz");
+    assert.equal(layer.name, "Imagery");
+    const source = layer.source as Record<string, unknown>;
+    assert.equal(source.type, "raster");
+    assert.deepEqual(source.tiles, ["https://x/{z}/{x}/{y}.png"]);
+    assert.equal(source.tileSize, 256);
+    // A non-shortUrl, non-redirected layer records no original/resolved URL.
+    const metadata = layer.metadata as Record<string, unknown>;
+    assert.equal(metadata.sourceKind, "xyz-url");
+    assert.equal(metadata.originalUrl, undefined);
+    assert.equal(metadata.resolvedUrl, undefined);
+  });
+
+  it("falls back to tile size 256 for a negative or non-numeric value", () => {
+    const negative = buildXyzLayer({
+      name: "Neg",
+      tileUrl: {
+        originalUrl: "https://x",
+        renderUrl: "https://x",
+        url: "https://x",
+        redirected: false,
+      },
+      tileSize: "-256",
+      shortUrl: false,
+    });
+    assert.equal((negative.source as Record<string, unknown>).tileSize, 256);
+  });
+
+  it("records the original and resolved URLs for a redirected short URL", () => {
+    const layer = buildXyzLayer({
+      name: "Short",
+      tileUrl: {
+        originalUrl: "https://short.example/abc",
+        renderUrl: "geolibre-xyz://abc/{z}/{x}/{y}",
+        url: "https://cdn.example/{z}/{x}/{y}.png",
+        redirected: true,
+      },
+      tileSize: "",
+      shortUrl: true,
+    });
+    const source = layer.source as Record<string, unknown>;
+    // An empty tile size falls back to the MapLibre default of 256.
+    assert.equal(source.tileSize, 256);
+    assert.equal(source.url, "https://short.example/abc");
+    const metadata = layer.metadata as Record<string, unknown>;
+    assert.equal(metadata.originalUrl, "https://short.example/abc");
+    assert.equal(metadata.resolvedUrl, "https://cdn.example/{z}/{x}/{y}.png");
+  });
+});
+
+describe("buildWmsLayer", () => {
+  it("builds a GetMap tile template, stripping operation params", () => {
+    const layer = buildWmsLayer({
+      name: "WMS",
+      // A pasted GetCapabilities URL: its operation params must be stripped.
+      endpoint: "https://example.com/wms?REQUEST=GetCapabilities&SERVICE=WMS",
+      layers: " topp:states ",
+      styles: "",
+      format: "image/png",
+      transparent: true,
+      tileSize: "512",
+      version: "1.3.0",
+    });
+    assert.equal(layer.type, "wms");
+    const source = layer.source as Record<string, unknown>;
+    assert.equal(source.tileSize, 512);
+    assert.equal(source.layers, "topp:states");
+    assert.equal(source.version, "1.3.0");
+    // Endpoint is stripped of the leftover REQUEST/SERVICE params.
+    assert.equal(source.url, "https://example.com/wms");
+    const tileUrl = (source.tiles as string[])[0];
+    assert.match(tileUrl, /REQUEST=GetMap/);
+    assert.match(tileUrl, /LAYERS=topp%3Astates/);
+    // WMS 1.3.0 uses CRS (not SRS) for the coordinate system parameter.
+    assert.match(tileUrl, /[?&]CRS=EPSG%3A3857/);
+    assert.equal((layer.metadata as Record<string, unknown>).service, "wms");
+  });
+
+  it("does not send a pasted capabilities outputFormat with GetMap tiles (#3010)", () => {
+    const layer = buildWmsLayer({
+      name: "VOGIS",
+      endpoint:
+        "https://vogis.cnv.at/geoserver/vogis/fwp_flaeche/ows?service=WMS&version=1.3.0&request=GetCapabilities&outputFormat=application/xml",
+      layers: "fwp_flaeche",
+      styles: "",
+      format: "image/png",
+      transparent: true,
+      tileSize: "256",
+      version: "1.3.0",
+    });
+    const source = layer.source as Record<string, unknown>;
+    assert.equal(source.url, "https://vogis.cnv.at/geoserver/vogis/fwp_flaeche/ows");
+    const tileUrl = (source.tiles as string[])[0];
+    assert.doesNotMatch(tileUrl, /outputformat/i);
+    assert.match(tileUrl, /FORMAT=image%2Fpng/);
+  });
+
+  it("marks the layer not queryable only when asked (#2887)", () => {
+    const params = {
+      name: "WMS",
+      endpoint: "https://example.com/wms",
+      layers: "buildings",
+      styles: "",
+      format: "image/png",
+      transparent: true,
+      tileSize: "256",
+      version: "1.3.0",
+    };
+    const off = buildWmsLayer({ ...params, queryable: false }).source as Record<string, unknown>;
+    assert.equal(off.queryable, false);
+    const unset = buildWmsLayer(params).source as Record<string, unknown>;
+    assert.equal("queryable" in unset, false);
+  });
+
+  it("attaches the GEBCO attribution for a GEBCO endpoint", () => {
+    const layer = buildWmsLayer({
+      name: "GEBCO",
+      endpoint: "https://wms.gebco.net/mapserv",
+      layers: "GEBCO_LATEST",
+      styles: "",
+      format: "image/png",
+      transparent: true,
+      tileSize: "256",
+      version: "1.3.0",
+    });
+    assert.equal((layer.source as Record<string, unknown>).attribution, GEBCO_ATTRIBUTION);
+  });
+
+  it("requests the tiles in the chosen CRS", () => {
+    const params = {
+      name: "WMS",
+      endpoint: "https://example.com/wms",
+      layers: "a",
+      styles: "",
+      format: "image/png",
+      transparent: true,
+      tileSize: "256",
+      version: "1.3.0",
+    };
+    const tileUrl = (layer: ReturnType<typeof buildWmsLayer>) =>
+      ((layer.source as Record<string, unknown>).tiles as string[])[0];
+    assert.match(tileUrl(buildWmsLayer({ ...params, crs: "epsg:25832" })), /[?&]CRS=EPSG%3A25832/);
+    // No CRS, or an empty one from a saved service, keeps Web Mercator.
+    assert.match(tileUrl(buildWmsLayer({ ...params, crs: "" })), /[?&]CRS=EPSG%3A3857/);
+    assert.throws(() => buildWmsLayer({ ...params, version: "1.1.1", crs: "CRS:84" }), /1\.3\.0/);
+  });
+});
+
+describe("buildWmtsLayer", () => {
+  it("builds a raster layer and trims the URL", () => {
+    const layer = buildWmtsLayer({
+      name: "WMTS",
+      url: "  https://tiles.example/{z}/{x}/{y}.png  ",
+      tileSize: "256",
+    });
+    assert.equal(layer.type, "wmts");
+    const source = layer.source as Record<string, unknown>;
+    assert.deepEqual(source.tiles, ["https://tiles.example/{z}/{x}/{y}.png"]);
+    assert.equal(source.attribution, undefined);
+  });
+
+  it("attaches the GEBCO attribution for a GEBCO tile host", () => {
+    const layer = buildWmtsLayer({
+      name: "GEBCO tiles",
+      url: "https://tiles.gebco.net/{z}/{x}/{y}.png",
+      tileSize: "256",
+    });
+    assert.equal((layer.source as Record<string, unknown>).attribution, GEBCO_ATTRIBUTION);
+  });
+});
+
+describe("buildWfsGeoJsonLayer", () => {
+  it("embeds the fetched collection and records the feature count", () => {
+    const data: FeatureCollection = {
+      type: "FeatureCollection",
+      features: [
+        { type: "Feature", geometry: { type: "Point", coordinates: [0, 0] }, properties: {} },
+        { type: "Feature", geometry: { type: "Point", coordinates: [0, 0] }, properties: {} },
+      ],
+    };
+    const layer = buildWfsGeoJsonLayer({
+      name: "States",
+      featureUrl: "https://example.com/wfs?REQUEST=GetFeature",
+      data,
+      typeName: "topp:states",
+      version: "2.0.0",
+      outputFormat: "application/json",
+      srsName: "EPSG:4326",
+    });
+    assert.equal(layer.type, "geojson");
+    assert.equal(layer.geojson, data);
+    assert.equal(layer.sourcePath, "https://example.com/wfs?REQUEST=GetFeature");
+    const metadata = layer.metadata as Record<string, unknown>;
+    assert.equal(metadata.featureCount, 2);
+    assert.equal(metadata.sourceKind, "wfs-getfeature");
+    assert.equal(metadata.typeName, "topp:states");
+  });
+
+  it("omits an empty srsName from the source", () => {
+    const layer = buildWfsGeoJsonLayer({
+      name: "No SRS",
+      featureUrl: "https://example.com/wfs",
+      data: { type: "FeatureCollection", features: [] },
+      typeName: "t",
+      version: "2.0.0",
+      outputFormat: "application/json",
+      srsName: "",
+    });
+    assert.equal((layer.source as Record<string, unknown>).srsName, undefined);
+  });
+
+  it("reserves a different palette color for a pending batch sibling", () => {
+    const data: FeatureCollection = {
+      type: "FeatureCollection",
+      features: [
+        { type: "Feature", geometry: { type: "Point", coordinates: [0, 0] }, properties: {} },
+      ],
+    };
+    const params = {
+      name: "First",
+      featureUrl: "https://example.com/wfs",
+      data,
+      typeName: "first",
+      version: "2.0.0",
+      outputFormat: "application/json",
+      srsName: "EPSG:4326",
+    };
+    const first = buildWfsGeoJsonLayer(params);
+    const second = buildWfsGeoJsonLayer({
+      ...params,
+      name: "Second",
+      typeName: "second",
+      pendingLayers: [first],
+    });
+    assert.notEqual(second.style.fillColor, first.style.fillColor);
+  });
+});
+
+describe("field mappers", () => {
+  it("reads XYZ fields with defaults", () => {
+    assert.deepEqual(xyzFieldsToRequest({ url: "https://x" }), {
+      url: "https://x",
+      tileSize: "256",
+      shortUrl: false,
+    });
+    assert.deepEqual(xyzFieldsToRequest({ url: "https://x", tileSize: "512", shortUrl: true }), {
+      url: "https://x",
+      tileSize: "512",
+      shortUrl: true,
+    });
+  });
+
+  it("resolves the WMS version from a saved field over the endpoint", () => {
+    const params = wmsFieldsToParams(
+      entry("wms", {
+        endpoint: "https://e/wms?VERSION=1.1.1",
+        layers: "a",
+        version: "1.3.0",
+      }),
+    );
+    // An explicit saved version wins over the endpoint's VERSION parameter.
+    assert.equal(params.version, "1.3.0");
+    assert.equal(params.layers, "a");
+    assert.equal(params.format, "image/png");
+    assert.equal(params.transparent, true);
+  });
+
+  it("falls back to the endpoint VERSION when no version field is saved", () => {
+    const params = wmsFieldsToParams(
+      entry("wms", { endpoint: "https://e/wms?VERSION=1.3.0", layers: "a" }),
+    );
+    assert.equal(params.version, "1.3.0");
+  });
+
+  it("reads the saved WMS CRS", () => {
+    const saved = wmsFieldsToParams(
+      entry("wms", { endpoint: "https://e/wms", layers: "a", crs: "EPSG:4326" }),
+    );
+    assert.equal(saved.crs, "EPSG:4326");
+    assert.equal(
+      wmsFieldsToParams(entry("wms", { endpoint: "https://e/wms", layers: "a" })).crs,
+      "",
+    );
+  });
+
+  it("defaults the WMS version to 1.1.1 when neither source has it", () => {
+    const params = wmsFieldsToParams(entry("wms", { endpoint: "https://e/wms", layers: "a" }));
+    assert.equal(params.version, "1.1.1");
+  });
+
+  it("reads WMTS fields with defaults", () => {
+    assert.deepEqual(wmtsFieldsToParams(entry("wmts", { url: "https://t" })), {
+      name: "Test service",
+      url: "https://t",
+      tileSize: "256",
+    });
+  });
+
+  it("strips WFS operation params and maps an empty maxFeatures to undefined", () => {
+    const request = wfsFieldsToRequest(
+      entry("wfs", {
+        endpoint: "https://e/wfs?REQUEST=GetCapabilities",
+        typeName: " topp:states ",
+        maxFeatures: "   ",
+      }),
+    );
+    assert.equal(request.endpoint, "https://e/wfs");
+    assert.equal(request.typeName, "topp:states");
+    assert.equal(request.version, "2.0.0");
+    assert.equal(request.outputFormat, "application/json");
+    assert.equal(request.srsName, "EPSG:4326");
+    assert.equal(request.maxFeatures, undefined);
+  });
+
+  it("detects ArcGIS vector-tile / portal-item and trims blanks to undefined", () => {
+    assert.deepEqual(
+      arcgisFieldsToOptions(
+        entry("arcgis", {
+          layerType: "vector-tile",
+          sourceType: "portal-item",
+          itemId: " abc ",
+          url: "",
+          portalUrl: "",
+        }),
+      ),
+      {
+        name: "Test service",
+        layerType: "vector-tile",
+        sourceType: "portal-item",
+        url: undefined,
+        itemId: "abc",
+        portalUrl: undefined,
+        // Unset paging fields mean "use the defaults" (whole layer, auto page).
+        pageSize: undefined,
+        maxFeatures: undefined,
+        sublayers: undefined,
+        splitSublayers: false,
+        renderingRule: undefined,
+      },
+    );
+    // Unknown/absent values fall back to the feature + url defaults.
+    const defaults = arcgisFieldsToOptions(entry("arcgis", { url: "https://s" }));
+    assert.equal(defaults.layerType, "feature");
+    assert.equal(defaults.sourceType, "url");
+    assert.equal(defaults.url, "https://s");
+  });
+
+  it("round-trips a saved map service, keeping its sublayer selection", () => {
+    const options = arcgisFieldsToOptions(
+      entry("arcgis", {
+        layerType: "map-service",
+        sourceType: "url",
+        url: "https://e/arcgis/rest/services/Boundaries/MapServer",
+        sublayers: " 2,5 ",
+        splitSublayers: true,
+      }),
+    );
+    // A saved map service must come back as one: coercing an unknown layer type
+    // to "feature" would silently load the wrong thing from the Browser panel.
+    assert.equal(options.layerType, "map-service");
+    assert.equal(options.sublayers, "2,5");
+    assert.equal(options.splitSublayers, true);
+  });
+
+  it("round-trips a saved image service, keeping its rendering rule", () => {
+    const options = arcgisFieldsToOptions(
+      entry("arcgis", {
+        layerType: "image-service",
+        sourceType: "url",
+        url: "https://e/arcgis/rest/services/Elevation/ImageServer",
+        renderingRule: '{"rasterFunction":"Hillshade"}',
+      }),
+    );
+    assert.equal(options.layerType, "image-service");
+    assert.equal(options.renderingRule, '{"rasterFunction":"Hillshade"}');
+  });
+});
+
+describe("applyServiceEntry", () => {
+  /** A dispatcher deps stub that records the layers added to the store. */
+  function stubDeps() {
+    const added: { layer: GeoLibreLayer; beforeLayerId: string | null }[] = [];
+    return {
+      added,
+      deps: {
+        addLayer: (layer: GeoLibreLayer, beforeLayerId: string | null = null) => {
+          added.push({ layer, beforeLayerId });
+        },
+        mapControllerRef: { current: null },
+      },
+    };
+  }
+
+  it("adds a WMS layer through the store, honoring the insert position", async () => {
+    const { added, deps } = stubDeps();
+    await applyServiceEntry(entry("wms", { endpoint: "https://e/wms", layers: "a" }, "My WMS"), {
+      ...deps,
+      beforeLayerId: "layer-2",
+    });
+    assert.equal(added.length, 1);
+    assert.equal(added[0].layer.type, "wms");
+    assert.equal(added[0].layer.name, "My WMS");
+    assert.equal(added[0].beforeLayerId, "layer-2");
+  });
+
+  it("keeps a saved WMS CRS out of the web build, which cannot reproject it", async () => {
+    const { added, deps } = stubDeps();
+    await applyServiceEntry(
+      entry("wms", { endpoint: "https://e/wms", layers: "a", crs: "EPSG:25832" }),
+      deps,
+    );
+    const source = added[0].layer.source as Record<string, unknown>;
+    assert.match((source.tiles as string[])[0], /[?&]SRS=EPSG%3A3857/);
+  });
+
+  it("requests a saved WMS CRS on desktop only when it can be reprojected", async () => {
+    const globals = globalThis as { window?: unknown };
+    const originalWindow = globals.window;
+    globals.window = { __TAURI_INTERNALS__: {} };
+    const tileFor = async (fields: Record<string, string>) => {
+      const { added, deps } = stubDeps();
+      await applyServiceEntry(
+        entry("wms", { endpoint: "https://e/wms", layers: "a", ...fields }),
+        deps,
+      );
+      const tiles = (added[0].layer.source as Record<string, unknown>).tiles as string[];
+      // The native protocol wraps the encoded GetMap URL, so decode twice.
+      return decodeURIComponent(decodeURIComponent(tiles[0]));
+    };
+    try {
+      assert.match(await tileFor({ crs: "EPSG:25832" }), /SRS=EPSG:25832/);
+      // Unknown to the EPSG tables, or not requestable with this version.
+      assert.match(await tileFor({ crs: "EPSG:999999" }), /SRS=EPSG:3857/);
+      assert.match(await tileFor({ crs: "CRS:84", version: "1.1.1" }), /SRS=EPSG:3857/);
+      assert.match(await tileFor({ crs: "CRS:84", version: "1.3.0" }), /CRS=CRS:84/);
+    } finally {
+      globals.window = originalWindow;
+    }
+  });
+
+  it("adds a WMTS layer through the store", async () => {
+    const { added, deps } = stubDeps();
+    await applyServiceEntry(entry("wmts", { url: "https://t/{z}/{x}/{y}" }), deps);
+    assert.equal(added.length, 1);
+    assert.equal(added[0].layer.type, "wmts");
+    assert.equal(added[0].beforeLayerId, null);
+  });
+
+  it("fetches WFS GeoJSON, adds the layer, and fits the map to it", async () => {
+    const added: { layer: GeoLibreLayer; beforeLayerId: string | null }[] = [];
+    const fitted: GeoLibreLayer[] = [];
+    const fc: FeatureCollection = {
+      type: "FeatureCollection",
+      features: [
+        {
+          type: "Feature",
+          geometry: { type: "Point", coordinates: [1, 2] },
+          properties: { id: 1 },
+        },
+      ],
+    };
+    const realFetch = globalThis.fetch;
+    // Stub the network so the wfs branch drives its real dynamic import +
+    // fetchWfsGeoJson + buildWfsGeoJsonLayer + addLayer/fitLayer wiring.
+    globalThis.fetch = (async () =>
+      new Response(JSON.stringify(fc), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      })) as typeof globalThis.fetch;
+    try {
+      await applyServiceEntry(
+        entry("wfs", { endpoint: "https://e/wfs", typeName: "topp:states" }, "States"),
+        {
+          addLayer: (layer, beforeLayerId = null) => {
+            added.push({ layer, beforeLayerId });
+          },
+          mapControllerRef: {
+            current: { fitLayer: (layer: GeoLibreLayer) => fitted.push(layer) },
+          } as unknown as Parameters<typeof applyServiceEntry>[1]["mapControllerRef"],
+        },
+      );
+    } finally {
+      globalThis.fetch = realFetch;
+    }
+    assert.equal(added.length, 1);
+    assert.equal(added[0].layer.type, "geojson");
+    assert.equal(added[0].layer.name, "States");
+    assert.equal(added[0].layer.geojson?.features.length, 1);
+    // The map is fit to the freshly added WFS layer (the same object).
+    assert.equal(fitted.length, 1);
+    assert.equal(fitted[0], added[0].layer);
+  });
+
+  it("throws (before any layer is added) when required fields are missing", async () => {
+    const { added, deps } = stubDeps();
+    await assert.rejects(
+      () => applyServiceEntry(entry("wms", { endpoint: "https://e" }), deps),
+      /no layers/i,
+    );
+    await assert.rejects(
+      () => applyServiceEntry(entry("wmts", { url: "  " }), deps),
+      /no tile URL/i,
+    );
+    // XYZ validates before the (browser-only) maplibre import, so this is safe
+    // to assert under Node.
+    await assert.rejects(() => applyServiceEntry(entry("xyz", { url: "" }), deps), /no tile URL/i);
+    await assert.rejects(() => applyServiceEntry(entry("wfs", { endpoint: "" }), deps), /no URL/i);
+    // WFS mirrors WfsSource's output-format and numeric max-features guards.
+    await assert.rejects(
+      () =>
+        applyServiceEntry(
+          entry("wfs", {
+            endpoint: "https://e/wfs",
+            typeName: "t",
+            outputFormat: "",
+          }),
+          deps,
+        ),
+      /output format/i,
+    );
+    await assert.rejects(
+      () =>
+        applyServiceEntry(
+          entry("wfs", {
+            endpoint: "https://e/wfs",
+            typeName: "t",
+            maxFeatures: "abc",
+          }),
+          deps,
+        ),
+      /max features/i,
+    );
+    assert.equal(added.length, 0);
+  });
+});

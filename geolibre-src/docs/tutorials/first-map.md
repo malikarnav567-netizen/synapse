@@ -1,0 +1,48 @@
+# Your First Map
+
+This tutorial takes you from an empty workspace to a styled map with inspectable data, in a few minutes. You can do all of it in the [live viewer](https://web.geolibre.app/).
+
+## 1. Open GeoLibre
+
+Open [web.geolibre.app](https://web.geolibre.app/), or launch the desktop app. You start with a basemap and an empty [Layers panel](../user-guide/layers.md).
+
+## 2. Add a layer
+
+1. Open **Add Data → Vector Layer**.
+2. In the Add Vector panel, enter a vector URL. You can use the sample countries dataset:
+   ```text
+   https://data.source.coop/giswqs/opengeos/countries.parquet
+   ```
+3. Click **Load**. The countries appear on the map and a `countries` layer is added to the Layers panel.
+
+![The Add Vector Layer panel with the sample URL ready to load](https://assets.geolibre.app/images/geolibre-add-vector-panel.webp)
+
+See [Adding Data](../user-guide/adding-data.md) for every supported source.
+
+## 3. Style the layer
+
+1. Select the `countries` layer in the Layers panel, then expand the [Style panel](../user-guide/styling.md) on the right if it is collapsed.
+2. Adjust the **Fill color**, **Outline color**, and **Fill opacity** to taste.
+3. To make a choropleth, set **Style type** to **Graduated**, pick a numeric **Attribute** (for example `POP_EST` or `GDP_MD_EST`), choose the number of **Classes**, a **Scheme**, and a **Colormap**, then click **Apply style type**.
+
+![The Style panel driving a data-driven style, with one colour per class listed below the colormap](https://assets.geolibre.app/images/geolibre-style-panel.webp)
+
+## 4. Inspect the data
+
+1. Click **Attribute table** on the status bar to expand it, then select the `countries` layer to load its records. See [Attribute Table](../user-guide/attribute-table.md).
+2. Sort by a column, or type in **Search attributes** to find a feature. Selecting a row highlights it on the map.
+3. Click **Explore** to profile every field at once — its type, how complete it is, and how its values are distributed.
+4. You can also turn on **Identify features** for the layer and click a country on the map to see its attributes in a popup.
+
+![The attribute table below the map, with its Explore, Statistics, Charts, and Export tools](https://assets.geolibre.app/images/geolibre-attribute-table.webp)
+
+## 5. Save or share
+
+- Use **Project → Save** to write a `.geolibre.json` file. The desktop app saves to disk; the browser build uses the browser's save dialog where it has one and otherwise downloads the file. See [Projects](../user-guide/projects.md#save-and-save-as).
+- Anywhere, use **Project → Share** to upload the project and get a public link. See [Sharing & Embedding](sharing-embedding.md).
+
+## Next steps
+
+- Load cloud-native and remote formats in [Cloud-Native Data](cloud-native-data.md).
+- Run geometry tools in [Vector Analysis](vector-analysis.md).
+- Query your data in [Spatial SQL](spatial-sql.md).

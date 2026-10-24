@@ -1,0 +1,73 @@
+/// <reference types="vite/client" />
+/// <reference types="vite-plugin-pwa/client" />
+
+declare const __GEOLIBRE_VERSION__: string;
+/** Version of the installed `geolibre-wasm` tool engine (OBIA provenance). */
+declare const __GEOLIBRE_WASM_VERSION__: string;
+
+// True only in the Microsoft Store MSIX build (GEOLIBRE_STORE_BUILD=1), where the
+// in-app update checker is removed so the app updates solely through the Store
+// (Microsoft policy 10.2.5). false in every other build. See vite.config.ts.
+declare const __GEOLIBRE_STORE_BUILD__: boolean;
+
+// True only in the Mac App Store build (GEOLIBRE_MAS_BUILD=1), where the App
+// Sandbox forbids the Python sidecar/Jupyter/martin helper processes, so the
+// UI compiles them out. false in every other build. See vite.config.ts.
+declare const __GEOLIBRE_MAS_BUILD__: boolean;
+
+// True only in the Jupyter embed wheel build (GEOLIBRE_EMBED=1), which is served
+// from inside a notebook and must never render a hosted deployment's sign-in
+// gate. false in every other build. Deliberately a *build* flag: the runtime
+// `isEmbedded()` heuristic accepts a `?embed=1` query parameter, which a visitor
+// controls and so cannot decide whether authentication applies. See
+// vite.config.ts.
+declare const __GEOLIBRE_EMBED_BUILD__: boolean;
+
+// True when the build is configured with GEOLIBRE_NO_EXTERNAL_CDN=1 to strip
+// all references to external CDN origins (unpkg.com, cdn.jsdelivr.net, etc.).
+// Features that depend on externally hosted resources (storymap HTML export,
+// built-in object detection models, ONNX WASM, 3D Tiles decoders, Pyodide) are
+// disabled or degraded. Intended for deployments that cannot load from untrusted
+// CDNs (e.g. Amazon/Harmony). See vite.config.ts.
+declare const __NO_EXTERNAL_CDN__: boolean;
+
+// jsDelivr URLs for the PGlite engine and its PostGIS extension, injected by
+// vite.config.ts. Only the embed (Jupyter wheel) build reads them, from
+// pglite-loader.cdn.ts; web/desktop builds bundle PGlite and never reference
+// these (the define values are null there).
+declare const __PGLITE_CDN_URL__: string | null;
+declare const __PGLITE_POSTGIS_CDN_URL__: string | null;
+
+// jsDelivr URL for the CereusDB (Apache Sedona) WASM blob, injected by
+// vite.config.ts and read by cereus-loader.cdn.ts. By default every build
+// (web/desktop/embed) CDN-loads it so the ~40 MB wasm never lands in dist; the
+// value is null only when GEOLIBRE_CEREUS_CDN=0 force-bundles it via the `?url`
+// import in cereus-loader.ts.
+declare const __CEREUS_WASM_CDN_URL__: string | null;
+
+// jsDelivr URLs for the gdal3.js (GDAL-WASM) engine + data, injected by
+// vite.config.ts and read by gdal-loader.ts for the Georeferencer's client-side
+// GeoTIFF export. null only when GEOLIBRE_GDAL_CDN=0 (export then unavailable).
+declare const __GDAL3_CDN_PATHS__: { wasm: string; data: string } | null;
+
+declare module "virtual:bundled-plugins" {
+  // Manifest paths (base-relative, no leading slash) for plugins dropped into
+  // public/plugins/<id>/, discovered at build time by the bundledPlugins() Vite
+  // plugin. See apps/geolibre-desktop/vite-plugins/bundled-plugins.ts.
+  export const bundledPluginManifestPaths: string[];
+}
+
+declare module "*.geojson?url" {
+  const url: string;
+  export default url;
+}
+
+declare module "shpjs" {
+  const shp: (input: unknown) => Promise<unknown>;
+  export default shp;
+  // Low-level parsers, used to build a FeatureCollection from already-unzipped
+  // shapefile components without shpjs re-unzipping the archive.
+  export function parseShp(shp: ArrayBuffer, prj?: string | ArrayBuffer): unknown;
+  export function parseDbf(dbf: ArrayBuffer, cpg?: string): unknown;
+  export function combine(inputs: [unknown, unknown]): unknown;
+}

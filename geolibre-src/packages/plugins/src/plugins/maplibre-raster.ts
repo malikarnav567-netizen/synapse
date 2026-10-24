@@ -1,0 +1,1622 @@
+import {
+  effectiveLayerRenderState,
+  explainS3ReadError,
+  resolveReadableUrl,
+  shouldZoomToNewLayers,
+  styleValue,
+  useAppStore,
+  installCogTilerDatumShift,
+  patchJpegCogSource,
+} from "@geolibre/core";
+import type { Layer } from "@deck.gl/core";
+import type { Map as MapboxMap } from "mapbox-gl";
+import type {
+  RasterControl,
+  RasterControlEventHandler,
+  RasterLayerState,
+  RasterWindowOptions,
+  RasterWindowReading,
+  RasterSampleDataset,
+  PixelReading,
+  RenderEngine,
+} from "maplibre-gl-raster";
+import type { GeoLibreAppAPI, GeoLibreCogRenderEngine, GeoLibreMapControlPosition } from "../types";
+import { ensureMercatorProjection } from "./map-projection-utils";
+import {
+  ensureSharedDeckOverlay,
+  onSharedDeckDevice,
+  setSharedDeckLayers,
+} from "./shared-deck-overlay";
+import {
+  isRasterControlStoreLayer,
+  rememberLocalRasterPath,
+  rememberControlRasterRenderState,
+  rendersNativeMapLibreLayer,
+  resetRasterStoreSyncSuspension,
+  runWithRasterStoreSyncSuspended,
+  savedRasterState,
+  setTransientRasterVisibility,
+  syncRasterLayersToStoreWithOptions,
+  unwireRasterStoreSync,
+  wireRasterStoreSync,
+} from "./raster-layer-sync";
+import {
+  activateRasterClassification,
+  disposeAllRasterClassification,
+  disposeRasterClassification,
+} from "./raster-symbology-texture";
+import { disposeAllPaletteLegends, disposePaletteLegend } from "./raster-palette";
+import { isNonTiledRasterError } from "./non-tiled-raster-error";
+import { readableStacLayerHref } from "./stac-signing";
+import { configureMapboxRasterEngine } from "./raster-mapbox-compat";
+import { focusPanel, restorePanelFocus } from "./panel-focus";
+import { datumShiftEpsgResolver, type EpsgResolver } from "./epsg-datum-resolver";
+
+const rasterControlPosition: GeoLibreMapControlPosition = "top-left";
+const RASTER_PANEL_CLASS = "geolibre-raster-panel";
+
+// The rendering backend rasters are decoded with unless the user picks another
+// one in the panel. `cog-tiler-wasm` feeds a native MapLibre raster source/layer,
+// so ordering is the map's own in both the web and desktop builds. Tauri local
+// files are exposed through its range-capable asset protocol; do not switch the
+// desktop default back to the GPU engine to work around local-file stalls, since
+// that would only mask an asset-protocol/read-path regression.
+//
+// Trade-off: the WASM tiler renders from its own built-in colormaps, so the
+// GPU-only symbology GeoLibre injects into the deck.gl pipeline -- "Classify
+// into discrete classes" and custom color ramps (see raster-symbology-texture)
+// -- does not apply while this engine is active. Users who need it can switch
+// the panel's Rendering engine back to maplibre-gl-raster (GPU).
+// Mapbox uses GPU instead: its workers cannot fetch the WASM tiler's protocol.
+const DEFAULT_RASTER_ENGINE: RenderEngine = "cog-tiler-wasm";
+
+// One-click sample COGs shown in the panel's "Load sample data" dropdown.
+// Edit this list to offer different (or more) demonstration rasters; loading
+// is opt-in, so an empty list simply hides the dropdown. URLs must be
+// CORS-enabled and range-request capable (source.coop is both). Labels are
+// rendered by the upstream control, which exposes no i18n callback, so they
+// stay plain strings (same gap as the vector plugin's sample list).
+const SAMPLE_RASTER_DATASETS: RasterSampleDataset[] = [
+  {
+    label: "Land cover",
+    url: "https://data.source.coop/giswqs/opengeos/nlcd_2021_land_cover_30m.tif",
+    attribution: "U.S. Geological Survey (USGS)",
+  },
+  {
+    label: "Elevation (DEM)",
+    url: "https://data.source.coop/giswqs/opengeos/dem.tif",
+    attribution: "U.S. Geological Survey (USGS)",
+  },
+  {
+    // A 3-band RGB aerial scene of the UC Berkeley campus (NAIP): a natural
+    // colour COG that also serves as the SamGeo plugin's demo image for text,
+    // point and box prompting.
+    label: "Aerial imagery (UC Berkeley)",
+    url: "https://data.source.coop/giswqs/opengeos/uc_berkeley.tif",
+    attribution: "USDA Farm Service Agency (FSA)",
+  },
+  {
+    // Global ocean/land bathymetry: a single-band DEM good for the colormap
+    // and hillshade modes. Attribution feeds the map's attribution control
+    // while the layer is visible (upstream RasterSampleDataset.attribution).
+    label: "Bathymetry (GEBCO)",
+    url: "https://data.source.coop/giswqs/gebco-bathymetry/gebco_2026/gebco_2026.tif",
+    attribution: "GEBCO Compilation Group (2026)",
+  },
+  {
+    // A multiband Sentinel-2 L2A scene: good for RGB composites and the
+    // normalized-difference index mode (NDVI and friends).
+    label: "Sentinel-2 (multiband)",
+    url: "https://data.source.coop/opengeos/geoai/S2C-MSIL2A-20250920T162001-subset.tif",
+    attribution: "Copernicus Sentinel data (ESA)",
+  },
+  {
+    // A gdalbuildvrt mosaic of six NAIP COG tiles (4-band RGB+NIR), read
+    // straight from the .vrt: exercises maplibre-gl-raster's VRT support
+    // (v0.11.0+), which renders a plain COG mosaic in the browser without GDAL.
+    label: "NAIP mosaic (VRT)",
+    url: "https://data.source.coop/giswqs/opengeos/naip_water_train.vrt",
+    attribution: "USDA Farm Service Agency (FSA)",
+  },
+  {
+    // A STAC FeatureCollection of 2023 North Dakota NAIP scenes, whose assets
+    // resolve to COGs on Azure blob storage: exercises maplibre-gl-raster's
+    // STAC mosaic support (v0.12.0+), which stitches the scenes at read time
+    // rather than requiring a prebuilt VRT or MosaicJSON.
+    label: "NAIP STAC mosaic (North Dakota)",
+    url: "https://data.source.coop/giswqs/opengeos/naip_nd_2023_stac.json",
+    attribution: "USDA Farm Service Agency (FSA)",
+  },
+];
+
+// This type mirrors undocumented private members of RasterControl from
+// maplibre-gl-raster (re-verified against v0.12.0). All access is optional (?.)
+// so a rename in a future release degrades to a no-op rather than a crash --
+// re-verify these names AND the .mlr-control-close selector in
+// wireRasterCloseButton when bumping the dependency.
+export type RasterControlInternals = {
+  _layerManager?: RasterLayerManagerInternals;
+  _panel?: HTMLElement;
+};
+
+type RasterControlConstructor = typeof RasterControl;
+type OverlayFactoryOptions = {
+  interleaved: boolean;
+  onDeviceInitialized: (device: unknown) => void;
+};
+type OverlayLike = {
+  setProps: (props: { layers?: unknown[] }) => void;
+};
+type MapControlHost = {
+  addControl: (control: unknown) => void;
+};
+type MapboxOverlayConstructor = new (props: Record<string, unknown>) => OverlayLike;
+type RasterLayerManagerInternals = {
+  // Comparison-mirror readiness reads the real MapboxOverlay. The main-map
+  // shared-overlay proxy need not expose these fields. Verified with 0.14.11.
+  _overlay?: {
+    _deck?: { isInitialized: boolean };
+    _props?: { layers?: { isLoaded: boolean }[] };
+  };
+  /** The currently selected raster id (read to restore it after inspect). */
+  selectedId?: string | null;
+  /**
+   * The panel's Add data section calls this directly (not the control's
+   * `addRaster`), so it is wrapped to default `zoomTo` to the map preference.
+   */
+  addRaster?: (source: string | File, options?: { zoomTo?: boolean }) => Promise<string>;
+  geolibreZoomToPatched?: boolean;
+  _device?: unknown;
+  _deps?: {
+    createOverlay?: (map: MapControlHost, options: OverlayFactoryOptions) => OverlayLike;
+    removeOverlay?: (map: MapControlHost, overlay: OverlayLike) => void;
+    loadGeoTIFF?: (url: string) => Promise<unknown>;
+    loadCogTiler?: () => Promise<CogTilerModule>;
+    geolibreJpegTablesPatched?: boolean;
+    geolibreTransparentOverlayPatched?: boolean;
+    geolibreTauriNodataPatched?: boolean;
+    geolibreSharedOverlayPatched?: boolean;
+  };
+};
+type CogTilerModule = {
+  openCog: (source: unknown) => Promise<unknown>;
+  /** cog-tiler-wasm >= 0.3.6: where lerc's wasm is served from. */
+  configureLercDecoder?: (options: { wasmUrl?: string | null }) => void;
+  [key: string]: unknown;
+};
+type RasterTileArray = {
+  bands?: unknown[];
+  data?: unknown;
+  nodata?: number | null;
+};
+type RasterTile = {
+  array?: RasterTileArray;
+};
+type TiledRasterSource = {
+  fetchTile?: (...args: unknown[]) => Promise<RasterTile>;
+  geolibreNodataPatched?: boolean;
+};
+type GeoTiffWithOverviews = TiledRasterSource & {
+  overviews?: TiledRasterSource[];
+};
+
+let rasterControlClassPromise: Promise<RasterControlConstructor> | null = null;
+/** maplibre-gl-raster's own resolver factory, captured with the control class. */
+let defaultEpsgResolver: (() => EpsgResolver) | null = null;
+let mapboxOverlayClassPromise: Promise<MapboxOverlayConstructor> | null = null;
+let rasterControl: RasterControl | null = null;
+let rasterControlMounted = false;
+// The host API the mounted control belongs to, so panel chrome wired outside a
+// call that carries it (the browse-button interception) can still add layers.
+let rasterHostApp: GeoLibreAppAPI | null = null;
+let restorePanelExpandTimeout: number | null = null;
+/**
+ * The `projectGeneration` in which the user last opened the panel, or null once
+ * it is closed. A restore pass for that same project (the map finishing its
+ * first style load, a basemap swap) must not apply the project's saved panel
+ * state over the user's newer choice (#2895, as for the vector panel).
+ */
+let panelOpenedInGeneration: number | null = null;
+let rasterControlInterleaved = true;
+// Unsubscribes the web raster overlay proxy from the shared Deck's device
+// notifications when the control's overlay is torn down (see
+// patchWebRasterOverlayFactory).
+let rasterSharedOverlayDeviceUnsubscribe: (() => void) | null = null;
+
+/**
+ * Details of a raster that the panel could not render because it is a striped
+ * (non-tiled) GeoTIFF rather than a tiled COG. Covers both a local file and a
+ * remote URL. Passed to a host handler registered via
+ * {@link setNonTiledRasterHandler}, which can offer to convert it to a COG (the
+ * conversion + UI live in the app layer, which has i18n and the client-side
+ * converter; this framework-agnostic package only detects the case).
+ */
+export interface NonTiledRasterRequest {
+  /** The failed layer's id. */
+  layerId: string;
+  /** The failed layer's display name (used for the converted layer too). */
+  name: string;
+  /** Whether {@link readBytes} streams a full file over the network (a remote
+   * URL source) rather than resolving instantly from a local blob URL. The host
+   * uses this to confirm with the user *before* a potentially large download
+   * starts, instead of after. */
+  bytesAreRemote: boolean;
+  /** Reads the original bytes (a local file from its blob URL, or a remote URL
+   * fetched whole). Must be awaited before {@link dismiss}, which revokes a
+   * local file's blob URL. */
+  readBytes: () => Promise<Uint8Array>;
+  /** Removes the failed layer from the map and the store. */
+  dismiss: () => void;
+}
+
+type NonTiledRasterHandler = (request: NonTiledRasterRequest) => void | Promise<void>;
+
+let nonTiledRasterHandler: NonTiledRasterHandler | null = null;
+// Layer ids currently being handled, so a repeated 'error' event for the same
+// failed layer does not prompt twice.
+const nonTiledInFlight = new Set<string>();
+// Cap the whole-file fetch of a remote striped GeoTIFF so a slow or stalled
+// server surfaces a clear conversion failure instead of hanging the handler
+// until the browser's (often minutes-long) global network timeout. A local
+// file's blob URL resolves instantly, so the bound only ever bites remote URLs.
+// Tuning knob: generous for the small striped GeoTIFFs this targets, but a very
+// large file on a slow link could hit it (the host then shows a download error);
+// raise it if that becomes common.
+const NON_TILED_FETCH_TIMEOUT_MS = 60_000;
+
+/**
+ * Register (or clear, with `null`) a handler invoked when a GeoTIFF (local file
+ * or remote URL) fails to load because it is striped rather than tiled. The app
+ * uses this to offer an in-browser convert-to-COG flow. Only one handler is
+ * active at a time.
+ *
+ * @param handler - The handler, or `null` to unregister.
+ */
+export function setNonTiledRasterHandler(handler: NonTiledRasterHandler | null): void {
+  nonTiledRasterHandler = handler;
+}
+
+/**
+ * Reads a raster off the local filesystem, given the absolute path a previous
+ * session recorded. Only the desktop host can implement this; in the browser
+ * there is no path and none is registered.
+ */
+export type LocalRasterFileReader = (path: string) => Promise<File | string>;
+
+/** A raster the user picked from a native file dialog: its bytes and its path. */
+export interface PickedLocalRaster {
+  file: File | string;
+  path: string;
+}
+
+/**
+ * Opens a native "choose a raster file" dialog. Registered by the desktop host
+ * so the panel's own browse button yields files whose paths GeoLibre can record
+ * (a webview `<input type="file">` gives a `File` with no path, which is why a
+ * panel-opened raster used to be lost on project reload). Resolves to an empty
+ * array when the user cancels.
+ */
+export type LocalRasterPicker = () => Promise<PickedLocalRaster[]>;
+
+let localRasterFileReader: LocalRasterFileReader | null = null;
+let localRasterPicker: LocalRasterPicker | null = null;
+
+/**
+ * Register (or clear, with `null`) the reader that reloads a File-backed raster
+ * from its recorded path when a saved project is reopened. Without one, such a
+ * raster is dropped on restore with a notice, as before.
+ *
+ * @param reader - The reader, or `null` to unregister.
+ */
+export function setLocalRasterFileReader(reader: LocalRasterFileReader | null): void {
+  localRasterFileReader = reader;
+}
+
+/**
+ * Register (or clear, with `null`) the native file picker the raster panel's
+ * browse button should use instead of its built-in `<input type="file">`.
+ *
+ * @param picker - The picker, or `null` to unregister.
+ */
+export function setLocalRasterPicker(picker: LocalRasterPicker | null): void {
+  localRasterPicker = picker;
+}
+
+/**
+ * Opens the maplibre-gl-raster panel, mounting the control on first use.
+ * Replaces the former Add Raster Layer dialog: the panel loads COGs and
+ * GeoTIFFs from URLs or local files and edits bands, rescale, colormaps,
+ * nodata, stretch, gamma, and opacity per layer.
+ *
+ * @param app - The GeoLibre app API.
+ */
+export function openRasterLayerPanel(app: GeoLibreAppAPI): void {
+  const openedInGeneration = useAppStore.getState().projectGeneration;
+  void (async () => {
+    const control = await ensureRasterControl(app);
+    if (!control) return;
+    // Recorded only once the control exists, so a failed open never makes a
+    // later restore skip the project's saved panel state.
+    panelOpenedInGeneration = openedInGeneration;
+    // Defer by one task so the control finishes its mount cycle before the
+    // panel is shown and expanded, matching the other standalone panels
+    // (Earth Engine, 3D Tiles); expanding in the same task as addControl can
+    // measure the panel before MapLibre has laid the control out.
+    window.setTimeout(() => {
+      // The IIFE's catch cannot see exceptions thrown in this later task.
+      try {
+        showRasterControl(control);
+        control.expand();
+        // Idempotent (guarded by a dataset flag / null checks): retried on
+        // every open so the panel chrome stays wired even if a future
+        // upstream release builds the panel DOM lazily on first expand.
+        wireRasterCloseButton(control);
+        wireRasterBrowseButton(control);
+        applyRasterPanelClass(control);
+        // Take keyboard focus off the menu trigger and into the panel (#2895).
+        focusPanel((control as unknown as RasterControlInternals)._panel, RASTER_CLOSE_SELECTOR);
+      } catch (error) {
+        console.error("[GeoLibre] Failed to open the raster layer panel", error);
+      }
+    }, 0);
+  })().catch((error) => {
+    console.error("[GeoLibre] Failed to open the raster layer panel", error);
+  });
+}
+
+/**
+ * Whether the primary renderer draws `cog` store records itself, so a raster
+ * is imported through the store (`native-raster-import.ts`) rather than the
+ * maplibre-gl-raster control.
+ *
+ * @param app - The GeoLibre app API.
+ * @returns True on the ArcGIS view and the Cesium globe.
+ */
+function drawsCogNatively(app: GeoLibreAppAPI): boolean {
+  const renderer = app.getMapRenderer?.();
+  // eslint-disable-next-line local/no-renderer-kind-checks -- picks the engine's own adapter
+  return renderer === "arcgis" || renderer === "cesium";
+}
+
+/**
+ * Adds a raster (GeoTIFF/COG) to the map from a remote URL or a local File,
+ * mounting the raster control on first use and zooming to the new layer. Used by
+ * the map drag and drop handler. The control's `rasteradd` event syncs the layer
+ * into the store, so it appears in the layer list and renders like any raster
+ * layer.
+ *
+ * @param app - The GeoLibre app API.
+ * @param source - A remote COG URL or a local GeoTIFF File.
+ * @param options - Optional display name for the layer, and, when the host read
+ *   the File off disk, the absolute path it came from so a saved project can
+ *   reload it.
+ */
+export async function addRasterToMap(
+  app: GeoLibreAppAPI,
+  source: string | File,
+  options: {
+    name?: string;
+    localPath?: string;
+    defaults?: RasterVisualizationDefaults;
+    /** Initial renderer state supplied by programmatic COG callers. */
+    state?: Partial<RasterLayerState>;
+    /** Existing map style layer beneath which the raster is inserted. */
+    beforeId?: string;
+    /**
+     * Whether to fit the map to the raster after loading. Defaults to the
+     * project's "Zoom to newly added layers" map preference.
+     */
+    zoomTo?: boolean;
+  } = {},
+): Promise<string> {
+  // The ArcGIS view and the Cesium globe draw `cog` records natively and have
+  // no MapLibre custom layer for this control to render through.
+  if (drawsCogNatively(app)) {
+    const { addNativeRaster } = await import("./native-raster-import");
+    return addNativeRaster(app, source, options);
+  }
+  // `s3://` sources and private-bucket object URLs are read through a
+  // presigned URL; the store sync maps it back to `source`. Signed before the
+  // control is taken, so a control replaced while signing is never used.
+  const readable = typeof source === "string" ? await resolveReadableUrl(source) : source;
+  const control = await ensureRasterControl(app);
+  if (!control) {
+    throw new Error("The raster control could not be initialized.");
+  }
+  // For File-backed rasters the control retains the original bytes behind a
+  // blob URL (source.objectUrl), which the store sync surfaces as
+  // metadata.localBytesUrl so in-browser tools (the WASM Whitebox runner) can
+  // read the data back. No extra bookkeeping is needed here.
+  // Before the add, so the layer is decoded by the chosen engine rather than
+  // being rendered once and swapped.
+  if (options.defaults?.engine && control.getEngine() !== options.defaults.engine) {
+    control.setEngine(options.defaults.engine);
+  }
+  // Named here rather than by the control, so a failure below removes exactly
+  // this add's raster and never one a concurrent add created.
+  const rasterId = `raster-${crypto.randomUUID().slice(0, 8)}`;
+  let id: string;
+  try {
+    id = await addRasterSource(control, readable, { ...options, id: rasterId });
+  } catch (error) {
+    // The control lists a raster before its header is read, so an add that
+    // failed (a blocked or unreachable URL) would otherwise stay in the Layers
+    // panel as an empty layer. A striped GeoTIFF is the exception: the
+    // non-tiled conversion offer (see the control's "error" handler) owns that
+    // raster, and reads its bytes, until it dismisses it.
+    const failed = control.getRaster(rasterId);
+    if (failed && !isNonTiledRasterError(failed.error)) control.removeRaster(rasterId);
+    // A bucket whose CORS rules block this origin fails as "Failed to fetch";
+    // say so instead.
+    throw typeof source === "string"
+      ? await explainS3ReadError(source, error, app.translate)
+      : error;
+  }
+  applyRgbBandDefaults(control, id, options.defaults?.rgbBands);
+  if (options.localPath) {
+    // The id only exists once addRaster resolves, which is after the rasteradd
+    // sync has already written the store layer -- so record the path and re-run
+    // the (diffing, idempotent) sync to put it on the layer.
+    rememberLocalRasterPath(id, options.localPath);
+    syncRasterLayersToStoreForRuntime(control);
+  }
+  return id;
+}
+
+/** The control call {@link addRasterToMap} makes, split out so its errors can be explained. */
+function addRasterSource(
+  control: RasterControl,
+  source: string | File,
+  options: Parameters<typeof addRasterToMap>[2] & object & { id: string },
+): Promise<string> {
+  return control.addRaster(source, {
+    id: options.id,
+    name: options.name,
+    zoomTo: options.zoomTo ?? shouldZoomToNewLayers(),
+    // Safe to pass before the band count is known: the renderer applies a
+    // colormap only in single-band mode and ignores it otherwise.
+    ...(options.state || options.defaults?.colormap
+      ? {
+          state: {
+            ...(options.defaults?.colormap ? { colormap: options.defaults.colormap } : {}),
+            ...options.state,
+          },
+        }
+      : {}),
+    ...(options.beforeId ? { beforeId: options.beforeId } : {}),
+  });
+}
+
+/** Switch the shared COG renderer, including rasters already on the map. */
+export async function setRasterRenderEngine(
+  app: GeoLibreAppAPI,
+  engine: RasterRenderEngine,
+): Promise<void> {
+  const control = await ensureRasterControl(app);
+  if (!control) throw new Error("The raster control could not be initialized.");
+  if (control.getEngine() !== engine) control.setEngine(engine);
+}
+
+/**
+ * The engine the shared raster control renders COGs with, mounting the control
+ * first when needed (a fresh one starts on `cog-tiler-wasm`). Lets a built-in
+ * plugin choose a path that suits the active engine instead of switching it,
+ * since the engine is control-wide and a switch re-renders every raster.
+ *
+ * @param app - The GeoLibre app API for the current map.
+ * @returns The active engine, or null when the control cannot be initialized.
+ */
+export async function getRasterRenderEngine(
+  app: GeoLibreAppAPI,
+): Promise<RasterRenderEngine | null> {
+  const control = await ensureRasterControl(app);
+  return control ? control.getEngine() : null;
+}
+
+/**
+ * Mount and warm the raster control without opening its panel.
+ *
+ * Desktop calls this as soon as a native file drag enters the window, so the
+ * control and its selected rendering backend can initialize while the user is
+ * still positioning the drop. Without that head start, drag-and-drop pays the
+ * full lazy-import/setup cost after release; the Add Raster Layer picker hides
+ * the same work behind the native file dialog and therefore feels immediate.
+ *
+ * Safe to call repeatedly: {@link ensureRasterControl} reuses the mounted
+ * control and the module-level import promises.
+ *
+ * @param app - The GeoLibre app API for the current map.
+ */
+export async function prepareRasterControl(app: GeoLibreAppAPI): Promise<void> {
+  await ensureRasterControl(app);
+}
+
+/**
+ * How a raster should look when it is first added, for callers that let the
+ * user set a house style (the Hugging Face browser's Settings tab).
+ *
+ * Split in two because a raster only ever honours one of them: an RGB band
+ * triple applies to multiband imagery, a colormap to single-band.
+ */
+export interface RasterVisualizationDefaults {
+  /** 1-indexed [R, G, B] to select when the image has three or more bands. */
+  rgbBands?: [number, number, number];
+  /** Colormap name for single-band imagery. */
+  colormap?: string;
+  /**
+   * Which renderer decodes the imagery.
+   *
+   * Unlike the two above, this is **not** per layer: the control holds one
+   * engine for every raster it manages, so setting it here re-renders the
+   * rasters already on the map too. Callers that expose it should say so.
+   */
+  engine?: RasterRenderEngine;
+}
+
+/**
+ * The renderers the raster control can decode with:
+ * `maplibre-gl-raster` reads the COG on the GPU via deck.gl,
+ * `cog-tiler-wasm` decodes in a WebAssembly tiler,
+ * `titiler` delegates to a TiTiler server.
+ */
+export type RasterRenderEngine = RenderEngine;
+
+// `GeoLibreCogRenderEngine` in ../types hand-mirrors this union: types.ts is the
+// public plugin-API surface, so it must not make `maplibre-gl-raster`'s types a
+// hard dependency of every external plugin. Nothing otherwise links the two, and
+// a renamed or dropped identifier would reach `control.setEngine()` as a string
+// the control no longer knows, with no build error. These assert both directions
+// so a bump of `maplibre-gl-raster` fails `npm run typecheck` instead.
+type Mirrors<Mirror extends Source, Source> = never;
+export type CogRenderEngineMirrorIsExact = [
+  Mirrors<GeoLibreCogRenderEngine, RasterRenderEngine>,
+  Mirrors<RasterRenderEngine, GeoLibreCogRenderEngine>,
+];
+
+/**
+ * Applies a default RGB band triple once the header has loaded.
+ *
+ * Done after the add rather than through `addRaster`'s `state` because the
+ * choice depends on the band count, which is only known once the GeoTIFF
+ * header is read — and `addRaster` resolves at exactly that point. Forcing
+ * `mode: "rgb"` up front would ask a single-band image for bands it does not
+ * have.
+ */
+function applyRgbBandDefaults(
+  control: RasterControl,
+  id: string,
+  rgbBands: [number, number, number] | undefined,
+): void {
+  if (!rgbBands) return;
+  const bandCount = control.getRasters().find((raster) => raster.id === id)?.bandCount ?? 0;
+  // Single-band and two-band images render through the colormap instead.
+  if (bandCount < 3) return;
+  const bands = rgbBands.map((band) =>
+    Math.min(Math.max(Math.round(band), 1), bandCount),
+  ) as number[];
+  control.setRasterState(id, { mode: "rgb", bands });
+}
+
+/**
+ * Pushes a layer's interleave position into the raster control: draw the raster
+ * (a deck.gl COG) beneath `beforeId`, or on top when `beforeId` is undefined.
+ *
+ * `@geolibre/map`'s layer-sync computes the beforeId from the store order but
+ * cannot move the deck layer itself (it has no real MapLibre style layer), so
+ * the desktop shell wires this as its deck-layer order handler. A no-op for any
+ * id the raster control does not own.
+ *
+ * @param layerId - The store/raster layer id.
+ * @param beforeId - The MapLibre style layer id to draw beneath, or undefined.
+ */
+export function applyRasterLayerOrder(layerId: string, beforeId: string | undefined): void {
+  rasterControl?.setRasterBeforeId(layerId, beforeId ?? null);
+}
+
+/** Change the live main-map visibility without mutating the persisted store. */
+export function setRasterMainVisibility(layerId: string, visible: boolean): void {
+  setTransientRasterVisibility(layerId, !visible);
+  rememberControlRasterRenderState(layerId, { visible });
+  runWithRasterStoreSyncSuspended(() => rasterControl?.setVisible(layerId, visible));
+}
+
+/** Read the live main-map visibility used by Layer Swipe. */
+export function getRasterMainVisibility(layerId: string): boolean {
+  return rasterControl?.getRaster(layerId)?.state.visible ?? true;
+}
+
+/** Live header state; saved project metadata is not evidence of a completed load. */
+export function getRasterLoadState(layerId: string) {
+  const raster = rasterControl?.getRaster(layerId);
+  const native = rasterControl ? rendersNativeMapLibreLayer(rasterControl.getEngine()) : false;
+  return {
+    loading: !raster || raster.loading,
+    error: raster?.error?.message ?? null,
+    native,
+    // The deck.gl engine only routes through the shared interleaved overlay --
+    // and so is only visible to getSharedDeckLoadState -- when the control was
+    // created interleaved. On Tauri it renders overlaid, into its own deck
+    // canvas that never calls setSharedDeckLayers (see
+    // patchWebRasterOverlayFactory), so the control's own header state above is
+    // the only load signal there.
+    deckTracked: !native && rasterControl !== null && rasterControlInterleaved,
+  };
+}
+
+export function closeRasterLayerPanel(app: GeoLibreAppAPI): void {
+  panelOpenedInGeneration = null;
+  if (restorePanelExpandTimeout !== null) {
+    window.clearTimeout(restorePanelExpandTimeout);
+    restorePanelExpandTimeout = null;
+  }
+
+  if (rasterControl && rasterControlMounted) {
+    app.removeMapControl(rasterControl);
+    return;
+  }
+
+  unwireRasterStoreSync();
+  resetRasterStoreSyncSuspension();
+  rasterControl = null;
+  rasterControlMounted = false;
+  rasterHostApp = null;
+}
+
+// The panel selection in effect before inspect stole focus, so it can be
+// restored when inspect stops (see setRasterPixelInspect).
+let rasterInspectPriorSelection: string | null = null;
+
+/**
+ * Drives the raster control's pixel-inspect mode for a raster/COG layer so the
+ * Layers-panel Identify action can read source band values on map click — the
+ * same behavior as the raster panel's Inspect button. Selects the target raster
+ * before enabling so the inspector reads the right layer, then restores the
+ * panel's prior selection when inspect stops so it doesn't silently steal focus
+ * from a raster the user had selected for editing. No-ops when the control
+ * isn't mounted (no raster layer exists yet).
+ *
+ * @param layerId - The raster/COG layer id to inspect.
+ * @param enabled - True to start inspecting, false to stop.
+ */
+export function setRasterPixelInspect(layerId: string, enabled: boolean): void {
+  if (!rasterControl) return;
+  const manager = (rasterControl as unknown as RasterControlInternals)._layerManager;
+  if (enabled) {
+    rasterInspectPriorSelection = manager?.selectedId ?? null;
+    rasterControl.selectRaster(layerId);
+    rasterControl.setInspect(true);
+  } else {
+    rasterControl.setInspect(false);
+    // Restore the prior selection only if inspect actually changed it.
+    if (rasterInspectPriorSelection !== layerId) {
+      rasterControl.selectRaster(rasterInspectPriorSelection);
+    }
+    rasterInspectPriorSelection = null;
+  }
+}
+
+/**
+ * Read one managed raster at a WGS84 coordinate without opening the control's
+ * own inspector popup.
+ *
+ * @param layerId Raster/COG layer id.
+ * @param lngLat WGS84 longitude and latitude.
+ * @param options Optional cancellation signal.
+ * @returns Pixel values, or null when the layer or coordinate has no data.
+ */
+export function readRasterPixel(
+  layerId: string,
+  lngLat: [number, number],
+  options?: { signal?: AbortSignal },
+): Promise<PixelReading | null> {
+  return rasterControl?.readRasterPixel(layerId, lngLat, options) ?? Promise.resolve(null);
+}
+
+/** Read a sampled raster window for viewport statistics in one batched request. */
+export function readRasterWindow(
+  layerId: string,
+  options: RasterWindowOptions,
+): Promise<RasterWindowReading | null> {
+  return rasterControl?.readRasterWindow(layerId, options) ?? Promise.resolve(null);
+}
+
+/**
+ * Replays rasters from the loaded project into the control and drops control
+ * rasters the project does not contain. Called by the desktop shell whenever a
+ * project is loaded or the map is reinitialised, mirroring
+ * restoreThreeDTilesLayers.
+ *
+ * URL-backed rasters replay from `source.url`. A raster that was opened from a
+ * local file replays from `metadata.localFilePath` when the host registered a
+ * reader (desktop) and the file is still there; otherwise -- the browser, a
+ * moved file, a project carried to another machine -- its panel entry is
+ * removed with a notice, as before.
+ *
+ * @param app - The GeoLibre app API.
+ */
+export function restoreRasterLayers(app: GeoLibreAppAPI): void {
+  if (drawsCogNatively(app)) {
+    void import("./native-raster-import")
+      .then(({ restoreNativeRasterFiles }) => restoreNativeRasterFiles(localRasterFileReader))
+      .catch(console.error);
+    return;
+  }
+  const hasRasterLayers = useAppStore.getState().layers.some(isRasterControlStoreLayer);
+  if (!hasRasterLayers && !rasterControl) return;
+
+  void (async () => {
+    const control = await ensureRasterControl(app);
+    if (!control) return;
+
+    // Read every local raster off disk BEFORE the suspension block below, so
+    // the replay stays synchronous. An await inside it would end the window
+    // early, and the next control event would then prune the not-yet-replayed
+    // layers out of the store.
+    const localFiles = await readLocalRasterFiles(control);
+    const remoteSources = new Map(
+      await Promise.all(
+        useAppStore
+          .getState()
+          .layers.filter(isRasterControlStoreLayer)
+          .flatMap((layer) => {
+            const url =
+              typeof layer.source.url === "string" && layer.source.url
+                ? layer.source.url
+                : undefined;
+            return url
+              ? [
+                  readableStacLayerHref(layer, url)
+                    // An `s3://` source (or a private bucket's object URL) is
+                    // signed afresh on every load; the saved URL holds no
+                    // signature.
+                    .then((href) =>
+                      resolveReadableUrl(href).catch((error: unknown) => {
+                        // One bucket's missing credentials must not stop the
+                        // other rasters from restoring.
+                        console.error(`[GeoLibre] Could not sign S3 raster "${layer.name}"`, error);
+                        return href;
+                      }),
+                    )
+                    .then((href) => [layer.id, { sourceUrl: url, href }] as const),
+                ]
+              : [];
+          }),
+      ),
+    );
+
+    // Re-read the store after the await: the project may have changed while
+    // the control class was loading.
+    const storeLayerIds = new Set(
+      useAppStore
+        .getState()
+        .layers.filter(isRasterControlStoreLayer)
+        .map((layer) => layer.id),
+    );
+
+    const pending: Promise<unknown>[] = [];
+    const panelCollapsed = rasterPanelCollapsedFromLayers(useAppStore.getState().layers);
+    // The suspension covers the synchronous events fired inside this block:
+    // removeRaster's rasterremove, and the rasteradd each addRaster emits
+    // before it awaits the GeoTIFF header (without it, the first rasteradd
+    // sync would prune store layers not yet replayed). The rasterchange
+    // events that follow header loads land after this window and sync
+    // incrementally; the Promise.allSettled pass below settles the rest.
+    runWithRasterStoreSyncSuspended(() => {
+      // Isolated so a DOM error from the panel-state restore cannot abort
+      // the raster replay below.
+      try {
+        // The user opened the panel after this project loaded, so their choice
+        // is newer than the saved state; leave the panel as they left it.
+        if (panelOpenedInGeneration !== useAppStore.getState().projectGeneration) {
+          applyRestoredRasterPanelState(control, panelCollapsed);
+        }
+      } catch (error) {
+        console.error("[GeoLibre] Failed to restore raster panel state", error);
+      }
+
+      for (const info of control.getRasters()) {
+        if (!storeLayerIds.has(info.id)) control.removeRaster(info.id);
+      }
+
+      // Built once here rather than handed to effectiveLayerRenderState as an
+      // array, which would rebuild it for every grouped raster in the loop.
+      const restoredGroups = new Map(
+        useAppStore.getState().layerGroups.map((group) => [group.id, group] as const),
+      );
+      for (const layer of useAppStore.getState().layers) {
+        if (!isRasterControlStoreLayer(layer)) continue;
+        if (control.getRaster(layer.id)) continue;
+
+        const storedUrl =
+          typeof layer.source.url === "string" && layer.source.url ? layer.source.url : undefined;
+        const resolvedSource = remoteSources.get(layer.id);
+        const url =
+          resolvedSource && resolvedSource.sourceUrl === storedUrl
+            ? resolvedSource.href
+            : storedUrl;
+        // A local file that was re-read above replays from its bytes; the
+        // control re-derives its own blob URL from the File, as on a fresh add.
+        const source = url ?? localFiles.get(layer.id);
+        if (!source) {
+          // Console-only on purpose for this first pass: the plugin layer has
+          // no toast/notification API today. Surface this through an in-app
+          // notification once one is exposed to plugins.
+          console.info(
+            `[GeoLibre] Raster layer "${layer.name}" came from a local file and cannot be restored from the saved project.`,
+          );
+          // removeLayer fires the store subscriber synchronously; the
+          // suspension guard keeps it from echoing back at the control.
+          useAppStore.getState().removeLayer(layer.id);
+          continue;
+        }
+
+        // A parent group's visibility/opacity never touch the child layer's
+        // own fields, so replay the folded values — otherwise a project saved
+        // with a hidden group reopens with its rasters painted on the map.
+        // Recorded so the first control event after the restore reads them as
+        // this replay's echo rather than as a control-side edit.
+        const effective = effectiveLayerRenderState(layer, restoredGroups);
+        rememberControlRasterRenderState(layer.id, effective);
+
+        pending.push(
+          control
+            .addRaster(source, {
+              id: layer.id,
+              name: layer.name,
+              state: {
+                ...savedRasterState(layer),
+                opacity: effective.opacity,
+                visible: effective.visible,
+                // The zoom range lives on layer.style (the shared Style-panel
+                // control), not in metadata.rasterState, so it is replayed here
+                // to survive a project reload / map reinitialisation.
+                minZoom: styleValue(layer.style, "minZoom"),
+                maxZoom: styleValue(layer.style, "maxZoom"),
+              },
+              zoomTo: false,
+            })
+            .catch((error) => {
+              console.error(`[GeoLibre] Failed to restore raster layer "${layer.name}"`, error);
+            }),
+        );
+      }
+    });
+
+    // Each addRaster syncs on its own events too, but those run while other
+    // restores may still be loading; this final pass settles the store once
+    // every raster has either loaded or failed.
+    void Promise.allSettled(pending).then(() => {
+      // Defer one task so this sync runs after the deferred panel expand in
+      // applyRestoredRasterPanelState: with no pending rasters, allSettled
+      // resolves as a microtask, and syncing then would briefly write the
+      // pre-expand collapsed state to the store. Ordering invariant: the
+      // expand timer is registered synchronously inside the suspension
+      // block above, this one from a microtask after it, and same-delay
+      // timers fire FIFO -- revisit if applyRestoredRasterPanelState ever
+      // becomes async.
+      window.setTimeout(() => {
+        // A control torn down mid-restore (map reinitialisation) must not
+        // let this stale callback rewrite layers owned by its successor.
+        if (control !== rasterControl) return;
+        syncRasterLayersToStoreForRuntime(control);
+      }, 0);
+    });
+  })().catch((error) => {
+    console.error("[GeoLibre] Failed to restore raster layers", error);
+  });
+}
+
+/**
+ * Re-reads every project raster that carries a recorded local path and is not
+ * already loaded in the control, keyed by layer id. Also re-registers each path
+ * so the raster stays restorable when the project is saved again.
+ *
+ * Reuses live browser blob URLs, or reopens saved paths through the registered
+ * desktop reader. Skips files that have moved or been deleted; the caller then
+ * falls back to dropping an unavailable layer with a notice.
+ *
+ * @param control - The mounted raster control.
+ * @returns The re-read files, by store layer id.
+ */
+async function readLocalRasterFiles(control: RasterControl): Promise<Map<string, File | string>> {
+  const files = new Map<string, File | string>();
+  const reader = localRasterFileReader;
+
+  for (const layer of useAppStore.getState().layers) {
+    if (!isRasterControlStoreLayer(layer)) continue;
+    if (control.getRaster(layer.id)) continue;
+    if (typeof layer.source.url === "string" && layer.source.url) continue;
+    const bytesUrl = layer.metadata.localBytesUrl;
+    if (typeof bytesUrl === "string" && bytesUrl.startsWith("blob:")) {
+      files.set(layer.id, bytesUrl);
+      continue;
+    }
+    const path = layer.metadata.localFilePath;
+    if (!reader || typeof path !== "string" || !path) continue;
+
+    try {
+      files.set(layer.id, await reader(path));
+      // The in-memory registry does not survive a project reload, so re-seed it
+      // from the project file; otherwise the next save would drop the path and
+      // the raster would become unrestorable again.
+      rememberLocalRasterPath(layer.id, path);
+    } catch (error) {
+      console.warn(
+        `[GeoLibre] Could not re-read raster layer "${layer.name}" from "${path}".`,
+        error,
+      );
+    }
+  }
+  return files;
+}
+
+async function ensureRasterControl(app: GeoLibreAppAPI): Promise<RasterControl | null> {
+  const RasterControlClass = await getRasterControlClass();
+
+  // A Mapbox check: null on the other engines, ArcGIS included (whose COGs
+  // take addNativeRaster and never mount this control). engine-audit-allow: arcgis-null-map
+  rasterControl ??= createRasterControl(RasterControlClass, !!app.getMapboxMap?.());
+
+  if (!rasterControlMounted) {
+    const added = app.addMapControl(rasterControl, rasterControlPosition);
+    if (!added) {
+      unwireRasterStoreSync();
+      rasterControl = null;
+      rasterHostApp = null;
+      return null;
+    }
+    rasterControlMounted = true;
+    rasterHostApp = app;
+    // The control mounts hidden: project restore must not surface a map
+    // button the user never asked for. openRasterLayerPanel shows it.
+    await patchTauriRasterOverlayFactory(rasterControl);
+    patchCogTilerJpegTables(rasterControl);
+    defaultRasterZoomToPreference(rasterControl);
+    await warmTauriWasmEngine(rasterControl);
+    // On web the control renders interleaved, which shares deck.gl's per-map
+    // Deck with the other interleaved overlays; route it through the shared
+    // overlay so it coexists with them (#1149). No-op on Tauri (overlaid).
+    patchWebRasterOverlayFactory(app, rasterControl);
+    // Patch the deck.gl render path so classified single-band rasters sample a
+    // custom stepped colormap. Must run after addMapControl: the LayerManager
+    // (and its _renderTileFor / _device) is created in the control's onAdd,
+    // not its constructor.
+    activateRasterClassification(rasterControl);
+    hideRasterControl(rasterControl);
+    wireRasterCloseButton(rasterControl);
+    wireRasterBrowseButton(rasterControl);
+    applyRasterPanelClass(rasterControl);
+    // engine-audit-allow: arcgis-null-map (a Mapbox check, as above)
+    if (app.getMapboxMap?.()) {
+      const panel = (rasterControl as unknown as RasterControlInternals)._panel;
+      panel?.querySelector('option[value="cog-tiler-wasm"]')?.remove();
+    }
+  }
+
+  return rasterControl;
+}
+
+/**
+ * Makes the raster control's "fit to the new raster" default follow the
+ * project's Map Preferences instead of the upstream `true`. A caller passing
+ * `zoomTo` explicitly (project restore passes `false`) is left alone. Must run
+ * after addMapControl, which is when the control creates its LayerManager.
+ *
+ * @param control - The mounted raster control.
+ */
+function defaultRasterZoomToPreference(control: RasterControl): void {
+  const manager = (control as unknown as RasterControlInternals)._layerManager;
+  if (!manager?.addRaster || manager.geolibreZoomToPatched) return;
+  const addRaster = manager.addRaster.bind(manager);
+  manager.addRaster = (source, options) =>
+    addRaster(source, { ...options, zoomTo: options?.zoomTo ?? shouldZoomToNewLayers() });
+  manager.geolibreZoomToPatched = true;
+}
+
+/**
+ * Decode abbreviated JPEG-in-TIFF tiles through geotiff.js.
+ *
+ * GDAL commonly stores the quantization/Huffman tables once in TIFF tag 347
+ * (`JPEGTables`) and omits them from each compressed tile. The whitebox-wasm
+ * streaming decoder used by cog-tiler-wasm 0.3.1 treats each tile as a complete
+ * JPEG, so these otherwise valid COGs fail with "use of unset quantization
+ * table" and the protocol returns transparent tiles. cog-tiler-wasm already
+ * opens multi-band projected rasters with geotiff.js for their CRS metadata;
+ * use that same range-aware reader for JPEG windows because it joins JPEGTables
+ * to the tile payload before decoding.
+ */
+function patchCogTilerJpegTables(control: RasterControl): void {
+  const manager = (control as unknown as RasterControlInternals)._layerManager;
+  const deps = manager?._deps;
+  if (!deps?.loadCogTiler || deps.geolibreJpegTablesPatched) return;
+
+  const loadCogTiler = deps.loadCogTiler;
+  deps.loadCogTiler = async () => {
+    const module = await loadCogTiler();
+    await configureLercWasmUrl(module);
+    return {
+      ...module,
+      openCog: async (input: unknown) => patchJpegCogSource(await module.openCog(input)),
+    };
+  };
+  deps.geolibreJpegTablesPatched = true;
+}
+
+/**
+ * Point cog-tiler-wasm's mask-aware LERC decoder (#2339) at lerc's wasm.
+ *
+ * lerc locates `lerc-wasm.wasm` relative to its own module URL, which Vite's
+ * hashed build output and dev pre-bundling do not rewrite: the fetch lands on
+ * index.html and the wasm compile aborts. Vite's `?url` import resolves the
+ * served asset in both modes. It is a dynamic import so the Node test runner,
+ * which cannot resolve the `?url` suffix, never evaluates it; a resolution
+ * failure leaves lerc's own lookup in place rather than breaking the tiler.
+ */
+async function configureLercWasmUrl(module: CogTilerModule): Promise<void> {
+  if (typeof module.configureLercDecoder !== "function") return;
+  try {
+    const { default: wasmUrl } = await import("lerc/lerc-wasm.wasm?url");
+    module.configureLercDecoder({ wasmUrl });
+  } catch (error) {
+    console.warn(
+      "[GeoLibre] Could not resolve lerc's wasm URL; LERC nodata may decode as 0",
+      error,
+    );
+  }
+}
+
+function getRasterControlClass(): Promise<RasterControlConstructor> {
+  // Defer the maplibre-gl-raster import (and its deck.gl GeoTIFF pipeline)
+  // until the user first opens the panel or a project restores a raster.
+  rasterControlClassPromise ??= Promise.all([
+    import("maplibre-gl-raster"),
+    // The control's default engine tiles with cog-tiler-wasm, which it imports
+    // itself: install the datum-shift hook on that same module first.
+    // An enhancement only: a tiler that fails to load must not block the
+    // panel (its engine reports its own error when it needs the tiler).
+    import("cog-tiler-wasm").then(installCogTilerDatumShift, () => undefined),
+  ]).then(
+    ([module]) => {
+      defaultEpsgResolver = module.createResilientEpsgResolver;
+      return module.RasterControl;
+    },
+    (error: unknown) => {
+      // Do not cache the rejection: a transient failure (e.g. the dev
+      // server restarting) would otherwise make every later open re-throw
+      // until the page reloads.
+      rasterControlClassPromise = null;
+      throw error;
+    },
+  );
+  return rasterControlClassPromise;
+}
+
+function getMapboxOverlayClass(): Promise<MapboxOverlayConstructor> {
+  mapboxOverlayClassPromise ??= import("@deck.gl/mapbox").then(
+    (module) => module.MapboxOverlay as unknown as MapboxOverlayConstructor,
+  );
+  return mapboxOverlayClassPromise;
+}
+
+function createRasterControl(
+  RasterControlClass: RasterControlConstructor,
+  mapbox: boolean,
+): RasterControl {
+  rasterControlInterleaved = !isTauriRuntime();
+  const control = new RasterControlClass({
+    className: "geolibre-raster-control",
+    // Datum shifts the default (epsg.io) resolver leaves out.
+    ...(defaultEpsgResolver ? { epsgResolver: datumShiftEpsgResolver(defaultEpsgResolver()) } : {}),
+    collapsed: true,
+    // No prefilled URL: the input stays empty (the upstream control supplies
+    // a generic COG-URL placeholder), and the sample COGs below are the
+    // explicit, opt-in way to load a demonstration raster.
+    sampleData: SAMPLE_RASTER_DATASETS,
+    // The panel doubles as the Add Raster Layer dialog, so it stays open
+    // until the user closes it; clicking the map must not collapse it.
+    closeOnOutsideClick: false,
+    engine: DEFAULT_RASTER_ENGINE,
+    // Only consulted while the deck.gl engine is selected; kept accurate so
+    // switching the panel back to maplibre-gl-raster still gets the overlay
+    // mode the runtime supports.
+    interleaved: rasterControlInterleaved,
+    panelWidth: 380,
+    title: "Add Raster Layer",
+  });
+  if (mapbox) configureMapboxRasterEngine(control);
+
+  // deck.gl's COG tile traversal does not support MapLibre's globe view
+  // ("TODO: implement getBoundingVolume in Globe view"), so adding a raster
+  // switches the map to mercator, like the other deck.gl-backed plugins.
+  // Only the deck.gl engine needs this: the WASM and TiTiler engines render
+  // through a native MapLibre raster layer, which draws on the globe just like
+  // any other raster source, so forcing mercator there would drop the user out
+  // of globe view for no reason.
+  // Also on rasterchange, which is what setEngine emits: switching the panel
+  // from the WASM engine back to the deck.gl one has to force mercator for the
+  // rasters already on the map, not just for the next one added.
+  for (const event of ["rasteradd", "rasterchange"] as const) {
+    control.on(event, () => {
+      if (rendersNativeMapLibreLayer(control.getEngine())) return;
+      if (control.getRasters().length === 0) return;
+      if (mapbox) {
+        // Mapbox calls this field `name`; MapLibre calls it `type`.
+        const map = control.getMap() as unknown as MapboxMap | undefined;
+        if (map?.getProjection().name !== "mercator") map?.setProjection("mercator");
+      } else {
+        ensureMercatorProjection(control.getMap());
+      }
+    });
+  }
+  for (const event of ["rasteradd", "rasterchange", "rasterremove"] as const) {
+    control.on(event, () => syncRasterLayersToStoreForRuntime(control));
+  }
+  // Free the per-layer classification GPU texture when its raster is dropped.
+  // The control owns the File-backed bytes blob (source.objectUrl) and revokes
+  // it on removeRaster, so there is nothing to clean up here for that.
+  control.on("rasterremove", (event) => {
+    if (!event.layerId) return;
+    disposeRasterClassification(event.layerId);
+    disposePaletteLegend(event.layerId);
+    rememberLocalRasterPath(event.layerId, undefined);
+  });
+  // A striped (non-tiled) GeoTIFF cannot be streamed as tiles, so the upstream
+  // fails the layer with a "not tiled" error. Offer the registered host handler
+  // a chance to convert it to a COG instead of leaving the user with a blank,
+  // errored layer. See opengeos/GeoLibre#789.
+  control.on("error", (event) => {
+    if (!event.layerId || !nonTiledRasterHandler) return;
+    const layerId = event.layerId;
+    if (nonTiledInFlight.has(layerId)) return;
+    const info = control.getRaster(layerId);
+    if (!info || !isNonTiledRasterError(info.error)) return;
+    // Re-read the original bytes so the host can convert them to a COG: a local
+    // file from its blob URL, a remote URL by fetching it whole. In the browser
+    // the remote fetch needs the server to allow CORS, which it normally has
+    // already (the panel range-fetched the header to detect "not tiled"); the
+    // Tauri build can patch the header read to go through Tauri commands, so a
+    // non-CORS URL can still reach here and the fetch below then fails -- it
+    // degrades safely to the host's download-failed message, not a crash. See
+    // opengeos/GeoLibre#916. The explicit per-kind check (rather than a file/else
+    // ternary) means a future source kind without a fetchable URL bails here
+    // instead of silently passing fetch(undefined), which would request the
+    // current page.
+    const bytesUrl =
+      info.source.kind === "file"
+        ? info.source.objectUrl
+        : info.source.kind === "url"
+          ? info.source.url
+          : undefined;
+    if (!bytesUrl) return;
+    // A remote URL streams the whole file over the network when read; a local
+    // file's blob URL resolves instantly. The host confirms before the download.
+    const bytesAreRemote = info.source.kind === "url";
+    const handler = nonTiledRasterHandler;
+    nonTiledInFlight.add(layerId);
+    // Invoke inside the promise chain so even a synchronous throw from the
+    // handler still clears the in-flight guard via finally. Clears once handling
+    // settles (converted, cancelled, or failed) so a later retry can prompt
+    // again.
+    void Promise.resolve()
+      .then(() =>
+        handler({
+          layerId,
+          name: info.name,
+          bytesAreRemote,
+          readBytes: async () => {
+            // Only bound the remote download; a local blob URL resolves from
+            // memory in microseconds, so a timeout timer there is pure overhead.
+            const response = await fetch(
+              bytesUrl,
+              bytesAreRemote
+                ? { signal: AbortSignal.timeout(NON_TILED_FETCH_TIMEOUT_MS) }
+                : undefined,
+            );
+            if (!response.ok) {
+              throw new Error(`Failed to read raster bytes: ${response.status}`);
+            }
+            return new Uint8Array(await response.arrayBuffer());
+          },
+          dismiss: () => {
+            // removeRaster emits 'rasterremove', which syncs the removal into
+            // the store and revokes any retained blob URL.
+            control.removeRaster(layerId);
+          },
+        }),
+      )
+      .catch((error: unknown) => console.error("[GeoLibre] Non-tiled raster handler failed", error))
+      .finally(() => nonTiledInFlight.delete(layerId));
+  });
+  // syncRasterLayersToStore re-reads getState().collapsed when these fire.
+  // Safe: expand()/collapse() delegate to toggle(), which flips
+  // _state.collapsed BEFORE emitting the event (re-verified against v0.12.0) --
+  // re-verify that ordering when bumping the dependency.
+  const panelStateSyncHandler: RasterControlEventHandler = () =>
+    syncRasterLayersToStoreForRuntime(control);
+  control.on("expand", panelStateSyncHandler);
+  control.on("collapse", panelStateSyncHandler);
+  wireRasterStoreSync(control);
+  patchRasterControlOnRemove(control, panelStateSyncHandler);
+
+  return control;
+}
+
+function syncRasterLayersToStoreForRuntime(control: RasterControl): void {
+  syncRasterLayersToStoreWithOptions(control, {
+    interleaved: rasterControlInterleaved,
+    // Read live rather than captured: the user can switch the backend from the
+    // panel at any time, and the store layer's native-layer bookkeeping differs
+    // per engine (see createRasterStoreLayer).
+    engine: control.getEngine(),
+  });
+}
+
+async function patchTauriRasterOverlayFactory(control: RasterControl): Promise<void> {
+  if (!isTauriRuntime()) return;
+
+  const manager = (control as unknown as RasterControlInternals)._layerManager;
+  const deps = manager?._deps;
+  if (!deps) return;
+
+  if (deps.createOverlay && !deps.geolibreTransparentOverlayPatched) {
+    const MapboxOverlayClass = await getMapboxOverlayClass();
+    deps.createOverlay = (map, options) => {
+      const overlay = new MapboxOverlayClass({
+        deviceProps: {
+          createCanvasContext: { alphaMode: "premultiplied" },
+          webgl: {
+            alpha: true,
+            premultipliedAlpha: true,
+          },
+        },
+        interleaved: false,
+        layers: [],
+        onDeviceInitialized: options.onDeviceInitialized,
+        parameters: {
+          clearColor: [0, 0, 0, 0],
+        },
+      });
+      map.addControl(overlay);
+      return overlay;
+    };
+    deps.geolibreTransparentOverlayPatched = true;
+  }
+
+  if (deps.loadGeoTIFF && !deps.geolibreTauriNodataPatched) {
+    const loadGeoTIFF = deps.loadGeoTIFF;
+    deps.loadGeoTIFF = async (url) => patchGeoTiffNumericNodata(await loadGeoTIFF(url));
+    deps.geolibreTauriNodataPatched = true;
+  }
+}
+
+/**
+ * Initialize Tauri's raster GPU canvas once before starting the WASM backend.
+ *
+ * WebKitGTK on native Wayland can leave concurrent WebAssembly initialization
+ * pending until an accelerated canvas has created its device. The visible
+ * symptom is a fully loaded raster entry whose WASM source never opens; choosing
+ * the GPU engine and then switching back immediately releases it. Perform that
+ * same one-time initialization while the control is still hidden, then restore
+ * the requested WASM default before any raster is added.
+ */
+async function warmTauriWasmEngine(control: RasterControl): Promise<void> {
+  if (!isTauriRuntime() || control.getEngine() !== "cog-tiler-wasm") return;
+
+  const manager = (control as unknown as RasterControlInternals)._layerManager;
+  if (!manager) return;
+
+  try {
+    control.setEngine("maplibre-gl-raster");
+    const deadline = performance.now() + 2_000;
+    while (!manager._device && performance.now() < deadline) {
+      await new Promise<void>((resolve) => window.setTimeout(resolve, 16));
+    }
+  } finally {
+    control.setEngine("cog-tiler-wasm");
+  }
+}
+
+/**
+ * On web the raster control renders interleaved, so its deck.gl overlay reuses
+ * deck.gl's single per-map Deck (`map.__deck`) -- and each interleaved overlay's
+ * setProps overwrites that Deck's whole layer list with only its own layers, so
+ * a raster and a Google/deckgl-viz overlay silently erase each other
+ * (opengeos/GeoLibre#1149). This routes the control's interleaved layers through
+ * the single shared deck overlay (./shared-deck-overlay.ts) instead: createOverlay
+ * returns a lightweight proxy whose only job is to forward the control's setProps
+ * into the shared overlay under the "raster" source, and the shared Deck's luma
+ * device is fed to the control's onDeviceInitialized so its classification
+ * colormap textures still allocate against the right GPU context.
+ *
+ * No-op on Tauri, which renders overlaid (a separate deck canvas that owns its
+ * own Deck) and so never touches the shared interleaved Deck.
+ *
+ * @param app - The host application API (drives the shared overlay).
+ * @param control - The mounted maplibre-gl-raster control.
+ */
+function patchWebRasterOverlayFactory(app: GeoLibreAppAPI, control: RasterControl): void {
+  if (isTauriRuntime()) return;
+
+  const manager = (control as unknown as RasterControlInternals)._layerManager;
+  const deps = manager?._deps;
+  if (!deps || deps.geolibreSharedOverlayPatched) return;
+
+  deps.createOverlay = (_map, options) => {
+    void ensureSharedDeckOverlay(app);
+    // Feed the shared Deck's device to the control so its GPU colormap textures
+    // allocate against the same context its COGLayers render in.
+    rasterSharedOverlayDeviceUnsubscribe?.();
+    rasterSharedOverlayDeviceUnsubscribe = onSharedDeckDevice((device) => {
+      options.onDeviceInitialized(device);
+    });
+    return {
+      setProps: (props: { layers?: unknown[] }) => {
+        setSharedDeckLayers("raster", (props.layers ?? []) as Layer[]);
+      },
+    };
+  };
+
+  // maplibre-gl-raster (re-verified against v0.12.0) calls `_deps.removeOverlay(this._map, this._overlay)`
+  // from its LayerManager teardown (after the last raster is removed / the
+  // control is destroyed); re-verify this hook exists when bumping the
+  // dependency. Even if a future version stopped calling it, the control still
+  // pushes an empty layer list through the proxy's setProps first, so the
+  // "raster" source is cleared regardless -- this only also drops the device
+  // subscription.
+  deps.removeOverlay = () => {
+    rasterSharedOverlayDeviceUnsubscribe?.();
+    rasterSharedOverlayDeviceUnsubscribe = null;
+    setSharedDeckLayers("raster", []);
+  };
+
+  deps.geolibreSharedOverlayPatched = true;
+}
+
+function patchGeoTiffNumericNodata(tiff: unknown): unknown {
+  patchTiledRasterSource(tiff);
+  for (const overview of (tiff as GeoTiffWithOverviews).overviews ?? []) {
+    patchTiledRasterSource(overview);
+  }
+  return tiff;
+}
+
+function patchTiledRasterSource(source: unknown): void {
+  const tiledSource = source as TiledRasterSource;
+  if (!tiledSource.fetchTile || tiledSource.geolibreNodataPatched) return;
+
+  const fetchTile = tiledSource.fetchTile.bind(source);
+  tiledSource.fetchTile = async (...args) => {
+    const tile = await fetchTile(...args);
+    normalizeTileNumericNodata(tile);
+    return tile;
+  };
+  tiledSource.geolibreNodataPatched = true;
+}
+
+function normalizeTileNumericNodata(tile: RasterTile): void {
+  const array = tile.array;
+  if (!array) return;
+  const nodata = array.nodata;
+  if (typeof nodata !== "number" || !Number.isFinite(nodata)) return;
+
+  let replaced = false;
+  if (Array.isArray(array.bands)) {
+    for (const band of array.bands) {
+      replaced = replaceFloat32NodataWithNaN(band, nodata) || replaced;
+    }
+  } else {
+    replaced = replaceFloat32NodataWithNaN(array.data, nodata);
+  }
+
+  if (replaced) array.nodata = Number.NaN;
+}
+
+function replaceFloat32NodataWithNaN(data: unknown, nodata: number): boolean {
+  if (!(data instanceof Float32Array)) return false;
+
+  let replaced = false;
+  for (let index = 0; index < data.length; index += 1) {
+    if (data[index] === nodata) {
+      data[index] = Number.NaN;
+      replaced = true;
+    }
+  }
+  return replaced;
+}
+
+function isTauriRuntime(): boolean {
+  return typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
+}
+
+function patchRasterControlOnRemove(
+  control: RasterControl,
+  panelStateSyncHandler: RasterControlEventHandler,
+): void {
+  const originalOnRemove = control.onRemove.bind(control);
+  control.onRemove = () => {
+    originalOnRemove();
+    if (rasterControl !== control) return;
+    // Symmetric with unwireRasterStoreSync below: a removed control must
+    // not keep syncing panel state if a stale reference toggles it.
+    control.off("expand", panelStateSyncHandler);
+    control.off("collapse", panelStateSyncHandler);
+    if (restorePanelExpandTimeout !== null) {
+      window.clearTimeout(restorePanelExpandTimeout);
+      restorePanelExpandTimeout = null;
+    }
+    unwireRasterStoreSync();
+    disposeAllRasterClassification();
+    disposeAllPaletteLegends();
+    // A control torn down mid-restore must not leave its successor
+    // permanently suppressing store sync events.
+    resetRasterStoreSyncSuspension();
+    // Store layers are intentionally NOT pruned here: the control is
+    // removed on map reinitialisation, where they must survive so
+    // restoreRasterLayers can replay them into the successor control.
+    rasterControl = null;
+    rasterControlMounted = false;
+    rasterHostApp = null;
+  };
+}
+
+function showRasterControl(control: RasterControl): void {
+  const container = control.getContainer();
+  if (container) container.style.display = "";
+}
+
+function hideRasterControl(control: RasterControl): void {
+  control.collapse();
+  const container = control.getContainer();
+  if (container) container.style.display = "none";
+}
+
+function applyRestoredRasterPanelState(control: RasterControl, panelCollapsed: boolean): void {
+  // A restore queued by an earlier project load must not fire after this
+  // one has applied a different panel state to the same control.
+  if (restorePanelExpandTimeout !== null) {
+    window.clearTimeout(restorePanelExpandTimeout);
+    restorePanelExpandTimeout = null;
+  }
+
+  if (panelCollapsed) {
+    hideRasterControl(control);
+    return;
+  }
+
+  showRasterControl(control);
+  // Defer the expand like openRasterLayerPanel does: on a first-mount
+  // restore this runs in the same task as addControl, and expanding before
+  // MapLibre has laid the control out can measure the panel at zero size.
+  restorePanelExpandTimeout = window.setTimeout(() => {
+    restorePanelExpandTimeout = null;
+    // A control torn down before this task runs (map reinitialisation)
+    // must not expand or fire panel-state syncs against its successor.
+    if (control !== rasterControl) return;
+    try {
+      control.expand();
+      wireRasterCloseButton(control);
+      wireRasterBrowseButton(control);
+      applyRasterPanelClass(control);
+    } catch (error) {
+      console.error("[GeoLibre] Failed to restore raster panel state", error);
+    }
+  }, 0);
+}
+
+function rasterPanelCollapsedFromLayers(
+  layers: ReturnType<typeof useAppStore.getState>["layers"],
+): boolean {
+  const panelCollapsed = layers.find(
+    (layer) =>
+      isRasterControlStoreLayer(layer) && typeof layer.metadata.panelCollapsed === "boolean",
+  )?.metadata.panelCollapsed;
+  // Older projects did not persist this UI state. Keep them collapsed so
+  // loading a raster project does not unexpectedly open the Add Data panel.
+  return typeof panelCollapsed === "boolean" ? panelCollapsed : true;
+}
+
+// The upstream stylesheet themes the panel from prefers-color-scheme (the
+// OS setting), while GeoLibre themes from the .dark class on <html>. The
+// app maps the panel's --mlr-* custom properties onto its own theme tokens
+// under this class (see index.css), so the panel follows the app theme.
+function applyRasterPanelClass(control: RasterControl): void {
+  const internals = control as unknown as RasterControlInternals;
+  internals._panel?.classList.add(RASTER_PANEL_CLASS);
+}
+
+const RASTER_CLOSE_SELECTOR = ".mlr-control-close";
+
+// The upstream close button only collapses the panel, leaving the map
+// button visible. Hide the whole control too so closing the panel restores
+// the pre-open map, like dismissing the dialog it replaces. Loaded rasters
+// keep rendering; the layer panel still manages them.
+function wireRasterCloseButton(control: RasterControl): void {
+  const panel = (control as unknown as RasterControlInternals)._panel;
+  const closeButton = panel?.querySelector<HTMLElement>(RASTER_CLOSE_SELECTOR);
+  if (!closeButton || closeButton.dataset.geolibreCloseWired === "true") {
+    return;
+  }
+  closeButton.dataset.geolibreCloseWired = "true";
+  closeButton.addEventListener("click", () => {
+    panelOpenedInGeneration = null;
+    restorePanelFocus(panel);
+    hideRasterControl(control);
+  });
+}
+
+// The panel's "click to browse" drop zone opens a hidden <input type="file">,
+// which in a webview yields a File with no filesystem path -- so a raster added
+// that way could never be reloaded from a saved project (issue #1463). When the
+// host registered a native picker (desktop), route the browse action through it
+// instead so the path is recorded.
+//
+// Listens on the panel in the CAPTURE phase rather than on the drop zone: a
+// capturing ancestor listener always runs before the target's own listeners,
+// whereas at the target both phases run in registration order -- and upstream
+// registered first. stopPropagation then keeps the event from reaching the drop
+// zone's handler at all. The selectors mirror maplibre-gl-raster's rendered
+// panel (re-verified against v0.14.0); if `.mlr-drop-zone` is renamed the
+// listener simply never matches and the built-in input takes over again.
+function wireRasterBrowseButton(control: RasterControl): void {
+  const panel = (control as unknown as RasterControlInternals)._panel;
+  if (!panel || panel.dataset.geolibreBrowseWired === "true") return;
+  panel.dataset.geolibreBrowseWired = "true";
+
+  const intercept = (event: Event): boolean => {
+    if (!localRasterPicker) return false;
+    const target = event.target;
+    if (!(target instanceof Element) || !target.closest(".mlr-drop-zone")) return false;
+    event.preventDefault();
+    event.stopPropagation();
+    void openLocalRasterPicker();
+    return true;
+  };
+
+  panel.addEventListener("click", intercept, true);
+  // The drop zone is keyboard-operable (role="button"); Enter/Space go through
+  // the same hidden input, so they need the same interception.
+  panel.addEventListener(
+    "keydown",
+    (event) => {
+      if (event.key !== "Enter" && event.key !== " ") return;
+      intercept(event);
+    },
+    true,
+  );
+}
+
+/**
+ * Opens the host's native raster picker and adds every pick, recording the
+ * filesystem path each one came from. A cancelled dialog resolves to an empty
+ * list and adds nothing.
+ */
+async function openLocalRasterPicker(): Promise<void> {
+  const picker = localRasterPicker;
+  const app = rasterHostApp;
+  if (!picker || !app) return;
+  try {
+    for (const picked of await picker()) {
+      // Sequential, matching the drag-and-drop path: each add awaits the
+      // GeoTIFF header, and the control zooms to the raster it just added.
+      // Each add is isolated so one unreadable pick does not silently discard
+      // the rest of a multi-file selection.
+      try {
+        await addRasterToMap(app, picked.file, {
+          name:
+            picked.file instanceof File
+              ? picked.file.name
+              : picked.path.split(/[\\/]/).pop() || picked.path,
+          localPath: picked.path,
+        });
+      } catch (error) {
+        const name =
+          picked.file instanceof File
+            ? picked.file.name
+            : picked.path.split(/[\\/]/).pop() || picked.path;
+        console.error(`[GeoLibre] Failed to add the raster "${name}"`, error);
+      }
+    }
+  } catch (error) {
+    console.error("[GeoLibre] Failed to add a raster from the file picker", error);
+  }
+}

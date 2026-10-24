@@ -1,0 +1,984 @@
+import assert from "node:assert/strict";
+import { afterEach, beforeEach, describe, it } from "node:test";
+import { DEFAULT_LAYER_STYLE, type GeoLibreLayer, useAppStore } from "@geolibre/core";
+import type { RasterLayerInfo, RasterLayerState } from "maplibre-gl-raster";
+import {
+  createRasterStoreLayer,
+  isRasterControlStoreLayer,
+  localRasterPath,
+  rememberLocalRasterPath,
+  removeRasterStoreLayers,
+  rendersNativeMapLibreLayer,
+  runWithRasterStoreSyncSuspended,
+  savedRasterState,
+  setTransientRasterVisibility,
+  syncRasterLayersToStore,
+  syncRasterLayersToStoreWithOptions,
+  unwireRasterStoreSync,
+  wireRasterStoreSync,
+  type RasterSyncableControl,
+} from "../packages/plugins/src/plugins/raster-layer-sync";
+import { STAC_ASSET_ACCESS_METADATA_KEY } from "../packages/plugins/src/plugins/stac-signing";
+
+function rasterState(patch: Partial<RasterLayerState> = {}): RasterLayerState {
+  return {
+    mode: "rgb",
+    bands: [1, 2, 3],
+    rescale: null,
+    colormap: "gray",
+    reversed: false,
+    nodata: "auto",
+    opacity: 1,
+    gamma: 1,
+    stretch: "linear",
+    visible: true,
+    ...patch,
+  };
+}
+
+function rasterInfo(patch: Partial<RasterLayerInfo> = {}): RasterLayerInfo {
+  return {
+    id: "raster-1",
+    name: "dem.tif",
+    source: { kind: "url", url: "https://example.com/dem.tif" },
+    memberUrls: null,
+    attribution: null,
+    bandCount: 3,
+    bandNames: null,
+    beforeId: null,
+    bounds: null,
+    loading: false,
+    error: null,
+    state: rasterState(),
+    ...patch,
+  };
+}
+
+/**
+ * Recorder fake standing in for RasterControl in store->control tests.
+ * getState is a static snapshot of options.collapsed: tests exercising
+ * event-driven expand/collapse transitions need a stateful fake instead.
+ */
+function fakeControl(infos: RasterLayerInfo[] = [], options: { collapsed?: boolean } = {}) {
+  const calls: { method: string; args: unknown[] }[] = [];
+  const control: RasterSyncableControl = {
+    getState: () => ({ collapsed: options.collapsed ?? true }),
+    getRasters: () => infos,
+    removeRaster: (id) => calls.push({ method: "removeRaster", args: [id] }),
+    setRasterState: (id, patch) => calls.push({ method: "setRasterState", args: [id, patch] }),
+    setVisible: (id, visible) => calls.push({ method: "setVisible", args: [id, visible] }),
+  };
+  return { control, calls };
+}
+
+function otherStoreLayer(id = "unrelated"): GeoLibreLayer {
+  return {
+    id,
+    name: "Unrelated",
+    type: "geojson",
+    source: { type: "geojson" },
+    visible: true,
+    opacity: 1,
+    style: { ...DEFAULT_LAYER_STYLE },
+    metadata: {},
+  };
+}
+
+// The projection rule in maplibre-raster.ts keys off this: only the deck.gl
+// engine cannot draw on the globe, so only it forces the map to mercator.
+describe("rendersNativeMapLibreLayer", () => {
+  it("is true for the engines backed by a real MapLibre raster layer", () => {
+    assert.equal(rendersNativeMapLibreLayer("cog-tiler-wasm"), true);
+    assert.equal(rendersNativeMapLibreLayer("titiler"), true);
+  });
+
+  it("is false for the deck.gl engine", () => {
+    assert.equal(rendersNativeMapLibreLayer("maplibre-gl-raster"), false);
+  });
+});
+
+describe("createRasterStoreLayer", () => {
+  it("mirrors a URL raster as an external custom cog layer", () => {
+    const layer = createRasterStoreLayer(
+      rasterInfo({
+        bounds: { west: -10, south: -5, east: 10, north: 5 },
+        state: rasterState({ opacity: 0.5, visible: false }),
+      }),
+    );
+
+    assert.equal(layer.id, "raster-1");
+    assert.equal(layer.name, "dem.tif");
+    assert.equal(layer.type, "cog");
+    assert.equal(layer.visible, false);
+    assert.equal(layer.opacity, 0.5);
+    assert.equal(layer.source.url, "https://example.com/dem.tif");
+    assert.equal(layer.sourcePath, "https://example.com/dem.tif");
+    assert.equal(layer.metadata.externalNativeLayer, true);
+    assert.equal(layer.metadata.externalDeckLayer, true);
+    assert.equal(layer.metadata.customLayerType, "raster");
+    assert.equal(layer.metadata.identifiable, false);
+    assert.equal(layer.metadata.panelCollapsed, true);
+    assert.equal(layer.metadata.rasterOverlayMode, "interleaved");
+    assert.equal(layer.metadata.sourceKind, "maplibre-gl-raster");
+    assert.deepEqual(layer.metadata.nativeLayerIds, ["raster-1"]);
+    // fitLayer falls back to metadata.bounds for zoom-to-layer.
+    assert.deepEqual(layer.metadata.bounds, [-10, -5, 10, 5]);
+    // A URL raster is fetchable directly, so no retained-bytes blob is set.
+    assert.equal("localBytesUrl" in layer.metadata, false);
+    assert.ok(isRasterControlStoreLayer(layer));
+  });
+
+  it("uses the file name for local files and omits bounds until known", () => {
+    const layer = createRasterStoreLayer(
+      rasterInfo({
+        source: { kind: "file", fileName: "local.tif", objectUrl: "blob:x" },
+      }),
+    );
+
+    assert.equal(layer.source.url, undefined);
+    assert.equal(layer.sourcePath, "local.tif");
+    assert.equal(layer.metadata.rasterSource, "file");
+    assert.equal("bounds" in layer.metadata, false);
+    // The control's retained-bytes blob URL is surfaced so in-browser tools
+    // (the WASM Whitebox runner) can read a locally loaded raster back.
+    assert.equal(layer.metadata.localBytesUrl, "blob:x");
+  });
+
+  it("persists the visualization state and surfaces load errors", () => {
+    const layer = createRasterStoreLayer(
+      rasterInfo({
+        error: new Error("CORS blocked"),
+        state: rasterState({
+          mode: "single",
+          bands: [2],
+          rescale: [[0, 4000]],
+          colormap: "viridis",
+          nodata: 0,
+          stretch: "sqrt",
+        }),
+      }),
+    );
+
+    assert.equal(layer.metadata.error, "CORS blocked");
+    // visible and opacity live on the top-level layer fields, not here.
+    assert.deepEqual(layer.metadata.rasterState, {
+      mode: "single",
+      bands: [2],
+      rescale: [[0, 4000]],
+      colormap: "viridis",
+      reversed: false,
+      nodata: 0,
+      gamma: 1,
+      stretch: "sqrt",
+    });
+  });
+
+  it("persists the raster panel collapsed state", () => {
+    const layer = createRasterStoreLayer(rasterInfo(), false);
+
+    assert.equal(layer.metadata.panelCollapsed, false);
+  });
+
+  it("marks overlaid deck rasters without MapLibre native layer ids", () => {
+    const layer = createRasterStoreLayer(rasterInfo(), true, {
+      interleaved: false,
+    });
+
+    assert.equal(layer.metadata.externalDeckLayer, true);
+    assert.equal(layer.metadata.rasterOverlayMode, "overlaid");
+    assert.deepEqual(layer.metadata.nativeLayerIds, []);
+  });
+
+  // The WASM/TiTiler engines add a real MapLibre raster layer keyed by the
+  // raster id, so ordering works even in the runtime that forces the deck.gl
+  // overlay into its own stacked canvas (issue #1463).
+  for (const engine of ["cog-tiler-wasm", "titiler"] as const) {
+    it(`gives the ${engine} engine a native layer id even when not interleaved`, () => {
+      const layer = createRasterStoreLayer(rasterInfo(), true, {
+        interleaved: false,
+        engine,
+      });
+
+      assert.equal(layer.metadata.rasterOverlayMode, "native");
+      assert.deepEqual(layer.metadata.nativeLayerIds, ["raster-1"]);
+      // Still set: it is what makes layer-sync push the computed beforeId back
+      // into the control, which those engines re-apply on every render change.
+      assert.equal(layer.metadata.externalDeckLayer, true);
+    });
+  }
+
+  it("keeps the deck.gl engine's overlay bookkeeping when named explicitly", () => {
+    const layer = createRasterStoreLayer(rasterInfo(), true, {
+      interleaved: false,
+      engine: "maplibre-gl-raster",
+    });
+
+    assert.equal(layer.metadata.rasterOverlayMode, "overlaid");
+    assert.deepEqual(layer.metadata.nativeLayerIds, []);
+  });
+
+  it("records a local raster's path so a saved project can reload it", () => {
+    rememberLocalRasterPath("raster-1", "/data/local.tif");
+    try {
+      const layer = createRasterStoreLayer(
+        rasterInfo({
+          source: { kind: "file", fileName: "local.tif", objectUrl: "blob:x" },
+        }),
+      );
+
+      assert.equal(layer.metadata.localFilePath, "/data/local.tif");
+      assert.equal(localRasterPath("raster-1"), "/data/local.tif");
+    } finally {
+      rememberLocalRasterPath("raster-1", undefined);
+    }
+  });
+
+  it("omits the path for a raster added without one, and after it is forgotten", () => {
+    const fileInfo = rasterInfo({
+      source: { kind: "file", fileName: "local.tif", objectUrl: "blob:x" },
+    });
+    assert.equal("localFilePath" in createRasterStoreLayer(fileInfo).metadata, false);
+
+    rememberLocalRasterPath("raster-1", "/data/local.tif");
+    rememberLocalRasterPath("raster-1", undefined);
+    assert.equal("localFilePath" in createRasterStoreLayer(fileInfo).metadata, false);
+    assert.equal(localRasterPath("raster-1"), undefined);
+  });
+
+  it("never claims a path for a URL raster, even if one was recorded", () => {
+    rememberLocalRasterPath("raster-1", "/data/stale.tif");
+    try {
+      assert.equal("localFilePath" in createRasterStoreLayer(rasterInfo()).metadata, false);
+    } finally {
+      rememberLocalRasterPath("raster-1", undefined);
+    }
+  });
+
+  it("persists a Tauri asset URL as a local path instead of a session URL", () => {
+    rememberLocalRasterPath("raster-1", "/data/local.tif");
+    try {
+      const layer = createRasterStoreLayer(
+        rasterInfo({
+          source: {
+            kind: "url",
+            url: "http://asset.localhost/%2Fdata%2Flocal.tif",
+          },
+        }),
+      );
+
+      assert.equal(layer.metadata.localFilePath, "/data/local.tif");
+      assert.equal(layer.metadata.rasterSource, "file");
+      assert.equal(layer.metadata.localBytesUrl, "http://asset.localhost/%2Fdata%2Flocal.tif");
+      assert.equal(layer.source.url, undefined);
+      assert.equal(layer.sourcePath, "local.tif");
+    } finally {
+      rememberLocalRasterPath("raster-1", undefined);
+    }
+  });
+
+  it("persists band count and serializes band names to pairs", () => {
+    const layer = createRasterStoreLayer(
+      rasterInfo({
+        bandCount: 2,
+        bandNames: new Map([
+          [1, "Red"],
+          [2, "NIR"],
+        ]),
+      }),
+    );
+
+    assert.equal(layer.metadata.bandCount, 2);
+    assert.deepEqual(layer.metadata.bandNames, [
+      [1, "Red"],
+      [2, "NIR"],
+    ]);
+  });
+
+  it("stores a null band count and band names before the header loads", () => {
+    const layer = createRasterStoreLayer(rasterInfo({ bandCount: null, bandNames: null }));
+
+    assert.equal(layer.metadata.bandCount, null);
+    assert.equal(layer.metadata.bandNames, null);
+  });
+});
+
+describe("syncRasterLayersToStore", () => {
+  beforeEach(() => {
+    useAppStore.setState({ layers: [] });
+  });
+
+  it("adds store layers for control rasters, leaving others alone", () => {
+    useAppStore.getState().addLayer(otherStoreLayer());
+    const { control } = fakeControl([
+      rasterInfo(),
+      rasterInfo({ id: "raster-2", name: "landcover.tif" }),
+    ]);
+
+    syncRasterLayersToStore(control);
+
+    const layers = useAppStore.getState().layers;
+    assert.equal(layers.length, 3);
+    assert.ok(layers.some((layer) => layer.id === "raster-1"));
+    assert.ok(layers.some((layer) => layer.id === "raster-2"));
+    assert.ok(layers.some((layer) => layer.id === "unrelated"));
+  });
+
+  it("can sync non-interleaved rasters without native layer ids", () => {
+    syncRasterLayersToStoreWithOptions(fakeControl([rasterInfo()]).control, {
+      interleaved: false,
+    });
+
+    const layer = useAppStore.getState().layers[0];
+    assert.equal(layer.metadata.rasterOverlayMode, "overlaid");
+    assert.deepEqual(layer.metadata.nativeLayerIds, []);
+  });
+
+  // localFilePath is derived from the path registry on every sync rather than
+  // carried in GEOLIBRE_OWNED_METADATA_KEYS, so a repeated sync (any control
+  // event: an opacity drag, a header load) must not drop it. The registry
+  // outlives a control teardown -- LayerManager.destroy() clears its layers
+  // without emitting rasterremove -- so the only thing that forgets a path is
+  // an actual raster removal, which drops the store layer too.
+  it("keeps a local raster's path across repeated syncs", () => {
+    const fileInfo = rasterInfo({
+      source: { kind: "file", fileName: "local.tif", objectUrl: "blob:x" },
+    });
+    rememberLocalRasterPath("raster-1", "/data/local.tif");
+    try {
+      syncRasterLayersToStore(fakeControl([fileInfo]).control);
+      assert.equal(useAppStore.getState().layers[0].metadata.localFilePath, "/data/local.tif");
+
+      // A later control event rebuilds the metadata wholesale.
+      syncRasterLayersToStore(
+        fakeControl([{ ...fileInfo, state: rasterState({ opacity: 0.4 }) }]).control,
+      );
+      const layer = useAppStore.getState().layers[0];
+      assert.equal(layer.opacity, 0.4);
+      assert.equal(layer.metadata.localFilePath, "/data/local.tif");
+    } finally {
+      rememberLocalRasterPath("raster-1", undefined);
+    }
+  });
+
+  // A plugin tags the layer addCogLayer returned (the Sentinel-2 Explorer's
+  // scene id drives its Add/Remove button); the header-load sync that follows
+  // must not wipe the tag, while control-owned keys still rebuild.
+  it("keeps metadata keys the control does not own across repeated syncs", () => {
+    syncRasterLayersToStore(fakeControl([rasterInfo({ error: new Error("stale") })]).control);
+    const layer = useAppStore.getState().layers[0];
+    useAppStore.getState().updateLayer(layer.id, {
+      metadata: { ...layer.metadata, sentinel2Scene: "S2B_10SEG", attribution: "ESA" },
+    });
+
+    // The header load: the error clears and the band count arrives.
+    syncRasterLayersToStore(fakeControl([rasterInfo({ bandCount: 1 })]).control);
+
+    const synced = useAppStore.getState().layers[0];
+    assert.equal(synced.metadata.bandCount, 1);
+    assert.equal(synced.metadata.sentinel2Scene, "S2B_10SEG");
+    assert.equal(synced.metadata.attribution, "ESA");
+    assert.equal(synced.metadata.error, undefined);
+  });
+
+  it("keeps STAC access metadata across repeated syncs", () => {
+    const access = {
+      catalogUrl: "https://planetarycomputer.microsoft.com/api/stac/v1/",
+      collectionId: "private-cog",
+      href: "https://example.blob.core.windows.net/private-cog/data.tif",
+    };
+    const signedSource = {
+      kind: "url" as const,
+      url: `${access.href}?sp=r&sig=old`,
+    };
+    syncRasterLayersToStore(fakeControl([rasterInfo({ source: signedSource })]).control);
+    const layer = useAppStore.getState().layers[0];
+    useAppStore.getState().updateLayer(layer.id, {
+      metadata: { ...layer.metadata, [STAC_ASSET_ACCESS_METADATA_KEY]: access },
+    });
+
+    syncRasterLayersToStore(
+      fakeControl([rasterInfo({ source: signedSource, state: rasterState({ opacity: 0.4 }) })])
+        .control,
+    );
+
+    assert.deepEqual(
+      useAppStore.getState().layers[0].metadata[STAC_ASSET_ACCESS_METADATA_KEY],
+      access,
+    );
+    assert.equal(useAppStore.getState().layers[0].source.url, access.href);
+    assert.equal(useAppStore.getState().layers[0].sourcePath, access.href);
+
+    syncRasterLayersToStore(
+      fakeControl([
+        rasterInfo({
+          source: {
+            kind: "url",
+            url: "https://example.blob.core.windows.net/private-cog/different.tif",
+          },
+        }),
+      ]).control,
+    );
+    assert.equal(
+      useAppStore.getState().layers[0].metadata[STAC_ASSET_ACCESS_METADATA_KEY],
+      undefined,
+    );
+  });
+
+  it("removes store layers whose rasters are gone", () => {
+    const { control } = fakeControl([rasterInfo()]);
+    syncRasterLayersToStore(control);
+    assert.equal(useAppStore.getState().layers.length, 1);
+
+    syncRasterLayersToStore(fakeControl([]).control);
+    assert.equal(useAppStore.getState().layers.length, 0);
+  });
+
+  it("refreshes changed fields but preserves panel renames", () => {
+    const { control } = fakeControl([rasterInfo()]);
+    syncRasterLayersToStore(control);
+    useAppStore.getState().updateLayer("raster-1", { name: "My DEM" });
+
+    syncRasterLayersToStore(
+      fakeControl([
+        rasterInfo({
+          bounds: { west: 0, south: 0, east: 1, north: 1 },
+          state: rasterState({ opacity: 0.4 }),
+        }),
+      ]).control,
+    );
+
+    const layer = useAppStore.getState().layers[0];
+    assert.equal(layer.name, "My DEM");
+    assert.equal(layer.opacity, 0.4);
+    assert.deepEqual(layer.metadata.bounds, [0, 0, 1, 1]);
+  });
+
+  it("preserves GeoLibre-owned symbology across a control resync", () => {
+    const { control } = fakeControl([rasterInfo()]);
+    syncRasterLayersToStore(control);
+
+    const symbology = {
+      classified: true,
+      ramp: "viridis",
+      reversed: false,
+      method: "equal-interval",
+      classCount: 2,
+      breaks: [0, 50, 100],
+    };
+    const layer = useAppStore.getState().layers[0];
+    useAppStore.getState().updateLayer("raster-1", {
+      metadata: { ...layer.metadata, rasterSymbology: symbology },
+    });
+
+    // A control event (e.g. bounds arriving) rebuilds the store layer's
+    // metadata wholesale; the symbology must survive since it is not on the
+    // control's RasterLayerInfo.
+    syncRasterLayersToStore(
+      fakeControl([rasterInfo({ bounds: { west: 0, south: 0, east: 1, north: 1 } })]).control,
+    );
+
+    assert.deepEqual(useAppStore.getState().layers[0].metadata.rasterSymbology, symbology);
+  });
+
+  it("refreshes the saved panel collapsed state", () => {
+    const { control } = fakeControl([rasterInfo()]);
+    syncRasterLayersToStore(control);
+    assert.equal(useAppStore.getState().layers[0].metadata.panelCollapsed, true);
+
+    syncRasterLayersToStore(fakeControl([rasterInfo()], { collapsed: false }).control);
+
+    assert.equal(useAppStore.getState().layers[0].metadata.panelCollapsed, false);
+  });
+
+  it("flips panelCollapsed on store layers when an expand event syncs", () => {
+    // Stateful stand-in for the production expand/collapse wiring: the
+    // handler mirrors panelStateSyncHandler in maplibre-raster.ts, and
+    // expand() flips the state before notifying, matching the verified
+    // maplibre-gl-raster event ordering.
+    let collapsed = true;
+    const handlers: Array<() => void> = [];
+    const control: RasterSyncableControl = {
+      getState: () => ({ collapsed }),
+      getRasters: () => [rasterInfo()],
+      removeRaster: () => {},
+      setRasterState: () => {},
+      setVisible: () => {},
+    };
+    handlers.push(() => syncRasterLayersToStore(control));
+    const expand = () => {
+      collapsed = false;
+      for (const handler of handlers) handler();
+    };
+
+    syncRasterLayersToStore(control);
+    assert.equal(useAppStore.getState().layers[0].metadata.panelCollapsed, true);
+
+    expand();
+
+    assert.equal(useAppStore.getState().layers[0].metadata.panelCollapsed, false);
+  });
+
+  it("does not touch an existing layer when nothing changed", () => {
+    const { control } = fakeControl([rasterInfo()]);
+    syncRasterLayersToStore(control);
+    const before = useAppStore.getState().layers[0];
+
+    // A second sync with an identical snapshot builds fresh source/metadata
+    // objects; the deep comparison must not report them as changed.
+    syncRasterLayersToStore(fakeControl([rasterInfo()]).control);
+
+    assert.equal(useAppStore.getState().layers[0], before);
+  });
+
+  it("does nothing while sync is suspended", () => {
+    const { control } = fakeControl([rasterInfo()]);
+    runWithRasterStoreSyncSuspended(() => {
+      syncRasterLayersToStore(control);
+    });
+    assert.equal(useAppStore.getState().layers.length, 0);
+  });
+});
+
+describe("wireRasterStoreSync", () => {
+  beforeEach(() => {
+    useAppStore.setState({ layers: [] });
+  });
+
+  afterEach(() => {
+    unwireRasterStoreSync();
+  });
+
+  it("applies panel visibility and opacity changes through the control", () => {
+    const { control, calls } = fakeControl([rasterInfo()]);
+    syncRasterLayersToStore(control);
+    wireRasterStoreSync(control);
+
+    useAppStore.getState().updateLayer("raster-1", { visible: false });
+    useAppStore.getState().updateLayer("raster-1", { opacity: 0.25 });
+
+    assert.deepEqual(calls, [
+      { method: "setVisible", args: ["raster-1", false] },
+      { method: "setRasterState", args: ["raster-1", { opacity: 0.25 }] },
+    ]);
+  });
+
+  it("drops the control raster when the panel removes the layer", () => {
+    const { control, calls } = fakeControl([rasterInfo()]);
+    syncRasterLayersToStore(control);
+    wireRasterStoreSync(control);
+
+    useAppStore.getState().removeLayer("raster-1");
+
+    assert.deepEqual(calls, [{ method: "removeRaster", args: ["raster-1"] }]);
+  });
+
+  it("does not echo control-driven syncs back at the control", () => {
+    const { control, calls } = fakeControl([rasterInfo()]);
+    syncRasterLayersToStore(control);
+    wireRasterStoreSync(control);
+
+    // A raster removed in the control's own panel: the event-driven sync
+    // removes the store layer, which must not bounce a removeRaster back.
+    syncRasterLayersToStore(fakeControl([]).control);
+
+    assert.equal(useAppStore.getState().layers.length, 0);
+    assert.deepEqual(calls, []);
+  });
+
+  it("ignores store changes that touch no raster layers", () => {
+    const { control, calls } = fakeControl([rasterInfo()]);
+    syncRasterLayersToStore(control);
+    wireRasterStoreSync(control);
+
+    useAppStore.getState().addLayer(otherStoreLayer());
+    useAppStore.getState().updateLayer("unrelated", { opacity: 0.5 });
+
+    assert.deepEqual(calls, []);
+  });
+
+  it("pushes edited rasterState fields through setRasterState", () => {
+    const { control, calls } = fakeControl([rasterInfo()]);
+    syncRasterLayersToStore(control);
+    wireRasterStoreSync(control);
+
+    const layer = useAppStore.getState().layers[0];
+    useAppStore.getState().updateLayer("raster-1", {
+      metadata: {
+        ...layer.metadata,
+        rasterState: {
+          ...(layer.metadata.rasterState as Record<string, unknown>),
+          mode: "single",
+          bands: [2],
+          colormap: "viridis",
+          rescale: [[0, 4000]],
+          nodata: 0,
+          stretch: "sqrt",
+          gamma: 2,
+        },
+      },
+    });
+
+    assert.deepEqual(calls, [
+      {
+        method: "setRasterState",
+        args: [
+          "raster-1",
+          {
+            mode: "single",
+            bands: [2],
+            colormap: "viridis",
+            rescale: [[0, 4000]],
+            nodata: 0,
+            stretch: "sqrt",
+            gamma: 2,
+          },
+        ],
+      },
+    ]);
+  });
+
+  it("does not push rasterState when only the symbology metadata changes", () => {
+    const { control, calls } = fakeControl([rasterInfo()]);
+    syncRasterLayersToStore(control);
+    wireRasterStoreSync(control);
+
+    const layer = useAppStore.getState().layers[0];
+    useAppStore.getState().updateLayer("raster-1", {
+      metadata: {
+        ...layer.metadata,
+        rasterSymbology: {
+          classified: true,
+          ramp: "viridis",
+          reversed: false,
+          method: "equal-interval",
+          classCount: 2,
+          breaks: [0, 50, 100],
+        },
+      },
+    });
+
+    assert.deepEqual(calls, []);
+  });
+
+  it("pushes the min/max zoom range through setRasterState when the style changes", () => {
+    const { control, calls } = fakeControl([rasterInfo()]);
+    syncRasterLayersToStore(control);
+    wireRasterStoreSync(control);
+
+    const layer = useAppStore.getState().layers[0];
+    useAppStore.getState().updateLayer("raster-1", {
+      style: { ...layer.style, minZoom: 6, maxZoom: 12 },
+    });
+
+    assert.deepEqual(calls, [
+      { method: "setRasterState", args: ["raster-1", { minZoom: 6, maxZoom: 12 }] },
+    ]);
+  });
+
+  it("does not push a zoom range when the style zoom bounds are unchanged", () => {
+    const { control, calls } = fakeControl([rasterInfo()]);
+    syncRasterLayersToStore(control);
+    wireRasterStoreSync(control);
+
+    const layer = useAppStore.getState().layers[0];
+    // A style edit that leaves minZoom/maxZoom untouched must not push a range.
+    useAppStore.getState().updateLayer("raster-1", {
+      style: { ...layer.style, fillOpacity: 0.5 },
+    });
+
+    assert.deepEqual(calls, []);
+  });
+});
+
+// A group's visibility/opacity never touch the child layer's own fields, and a
+// deck.gl-rendered raster has no MapLibre style layer for layer-sync to toggle,
+// so the control push below is the only thing that can hide it (GeoLibre#1717).
+describe("wireRasterStoreSync with layer groups", () => {
+  beforeEach(() => {
+    useAppStore.setState({ layers: [], layerGroups: [] });
+  });
+
+  afterEach(() => {
+    unwireRasterStoreSync();
+    useAppStore.setState({ layerGroups: [] });
+  });
+
+  it("hides a raster through the control when its parent group is hidden", () => {
+    const { control, calls } = fakeControl([rasterInfo()]);
+    syncRasterLayersToStore(control);
+    wireRasterStoreSync(control);
+
+    const groupId = useAppStore.getState().addLayerGroup("Group 1", ["raster-1"]);
+    // Joining a visible group changes nothing about how the raster renders.
+    assert.deepEqual(calls, []);
+
+    useAppStore.getState().setLayerGroupVisibility(groupId, false);
+    assert.deepEqual(calls, [{ method: "setVisible", args: ["raster-1", false] }]);
+
+    calls.length = 0;
+    useAppStore.getState().setLayerGroupVisibility(groupId, true);
+    assert.deepEqual(calls, [{ method: "setVisible", args: ["raster-1", true] }]);
+  });
+
+  it("multiplies a parent group's opacity into the pushed raster opacity", () => {
+    const { control, calls } = fakeControl([rasterInfo({ state: rasterState({ opacity: 0.5 }) })]);
+    syncRasterLayersToStore(control);
+    wireRasterStoreSync(control);
+
+    const groupId = useAppStore.getState().addLayerGroup("Group 1", ["raster-1"]);
+    calls.length = 0;
+    useAppStore.getState().setLayerGroupOpacity(groupId, 0.4);
+
+    assert.deepEqual(calls, [{ method: "setRasterState", args: ["raster-1", { opacity: 0.2 }] }]);
+  });
+
+  it("hides a raster dragged into an already hidden group", () => {
+    const { control, calls } = fakeControl([rasterInfo()]);
+    syncRasterLayersToStore(control);
+    wireRasterStoreSync(control);
+
+    const groupId = useAppStore.getState().addLayerGroup("Group 1");
+    useAppStore.getState().setLayerGroupVisibility(groupId, false);
+    calls.length = 0;
+    useAppStore.getState().moveLayerToGroup("raster-1", groupId);
+
+    assert.deepEqual(calls, [{ method: "setVisible", args: ["raster-1", false] }]);
+  });
+
+  it("keeps the layer's own visibility when the control echoes the group fold", () => {
+    const { control } = fakeControl([rasterInfo()]);
+    syncRasterLayersToStore(control);
+    wireRasterStoreSync(control);
+
+    const groupId = useAppStore.getState().addLayerGroup("Group 1", ["raster-1"]);
+    useAppStore.getState().setLayerGroupVisibility(groupId, false);
+
+    // Any later control event (a colormap edit, a header load) mirrors the
+    // control's whole raster list back. It now reports the folded `false`, and
+    // burning that into the layer would leave it hidden after the group is
+    // shown again.
+    syncRasterLayersToStore(
+      fakeControl([rasterInfo({ state: rasterState({ visible: false }) })]).control,
+    );
+
+    assert.equal(useAppStore.getState().layers[0].visible, true);
+  });
+
+  it("keeps the layer's own opacity when the control echoes the group fold", () => {
+    const { control } = fakeControl([rasterInfo()]);
+    syncRasterLayersToStore(control);
+    wireRasterStoreSync(control);
+
+    const groupId = useAppStore.getState().addLayerGroup("Group 1", ["raster-1"]);
+    useAppStore.getState().setLayerGroupOpacity(groupId, 0.4);
+
+    syncRasterLayersToStore(
+      fakeControl([rasterInfo({ state: rasterState({ opacity: 0.4 }) })]).control,
+    );
+
+    assert.equal(useAppStore.getState().layers[0].opacity, 1);
+  });
+
+  it("still records a control-side opacity edit made under a faded group", () => {
+    const { control } = fakeControl([rasterInfo({ state: rasterState({ opacity: 0.5 }) })]);
+    syncRasterLayersToStore(control);
+    wireRasterStoreSync(control);
+
+    const groupId = useAppStore.getState().addLayerGroup("Group 1", ["raster-1"]);
+    useAppStore.getState().setLayerGroupOpacity(groupId, 0.4);
+
+    // The guard suppresses only the 0.2 this module pushed (0.5 * 0.4). The
+    // user dragging the control's own opacity slider reports something else,
+    // which must still reach the layer's own opacity.
+    syncRasterLayersToStore(
+      fakeControl([rasterInfo({ state: rasterState({ opacity: 0.9 }) })]).control,
+    );
+
+    assert.equal(useAppStore.getState().layers[0].opacity, 0.9);
+  });
+
+  it("records a control-side toggle away from the pushed value and back again", () => {
+    const { control } = fakeControl([rasterInfo()]);
+    syncRasterLayersToStore(control);
+    wireRasterStoreSync(control);
+
+    const groupId = useAppStore.getState().addLayerGroup("Group 1", ["raster-1"]);
+    useAppStore.getState().setLayerGroupVisibility(groupId, false);
+
+    // The user checks the control's own box, then unchecks it. The second edit
+    // lands back on the value the group fold pushed, so a guard that only ever
+    // remembered the *pushed* value would read it as an echo and drop it --
+    // leaving the raster to reappear when the group is shown again.
+    syncRasterLayersToStore(control);
+    assert.equal(useAppStore.getState().layers[0].visible, true);
+
+    syncRasterLayersToStore(
+      fakeControl([rasterInfo({ state: rasterState({ visible: false }) })]).control,
+    );
+
+    assert.equal(useAppStore.getState().layers[0].visible, false);
+  });
+
+  it("still records a genuine control-side hide made under a visible group", () => {
+    const { control } = fakeControl([rasterInfo()]);
+    syncRasterLayersToStore(control);
+    wireRasterStoreSync(control);
+
+    useAppStore.getState().addLayerGroup("Group 1", ["raster-1"]);
+    syncRasterLayersToStore(
+      fakeControl([rasterInfo({ state: rasterState({ visible: false }) })]).control,
+    );
+
+    assert.equal(useAppStore.getState().layers[0].visible, false);
+  });
+});
+
+describe("removeRasterStoreLayers", () => {
+  beforeEach(() => {
+    useAppStore.setState({ layers: [] });
+  });
+
+  afterEach(() => {
+    unwireRasterStoreSync();
+  });
+
+  it("prunes raster layers without echoing removals at the control", () => {
+    const { control, calls } = fakeControl([rasterInfo()]);
+    syncRasterLayersToStore(control);
+    useAppStore.getState().addLayer(otherStoreLayer());
+    wireRasterStoreSync(control);
+
+    removeRasterStoreLayers();
+
+    const layers = useAppStore.getState().layers;
+    assert.equal(layers.length, 1);
+    assert.equal(layers[0].id, "unrelated");
+    assert.deepEqual(calls, []);
+  });
+});
+
+// Layer Swipe hides a right-only raster on the main map through the control
+// without touching the store, and marks the id transient so the control's
+// report of that hide is not mirrored back as a user edit (which would burn
+// the swipe's temporary state into the saved project).
+describe("transient raster visibility", () => {
+  beforeEach(() => {
+    useAppStore.setState({ layers: [] });
+  });
+
+  afterEach(() => {
+    setTransientRasterVisibility("raster-1", false);
+    unwireRasterStoreSync();
+    useAppStore.setState({ layers: [] });
+  });
+
+  it("keeps the store's visibility when a transient hide is reported back", () => {
+    syncRasterLayersToStore(fakeControl([rasterInfo()]).control);
+    setTransientRasterVisibility("raster-1", true);
+
+    syncRasterLayersToStore(
+      fakeControl([rasterInfo({ state: rasterState({ visible: false }) })]).control,
+    );
+
+    assert.equal(useAppStore.getState().layers[0].visible, true);
+  });
+
+  it("mirrors a real visibility change once the mark is cleared", () => {
+    syncRasterLayersToStore(fakeControl([rasterInfo()]).control);
+    setTransientRasterVisibility("raster-1", true);
+    setTransientRasterVisibility("raster-1", false);
+
+    syncRasterLayersToStore(
+      fakeControl([rasterInfo({ state: rasterState({ visible: false }) })]).control,
+    );
+
+    assert.equal(useAppStore.getState().layers[0].visible, false);
+  });
+
+  it("forgets the mark when the control drops the raster", () => {
+    syncRasterLayersToStore(fakeControl([rasterInfo()]).control);
+    setTransientRasterVisibility("raster-1", true);
+
+    // The raster is removed (its store layer goes with it), so the mark cannot
+    // apply to anything; a later raster reusing the id must not inherit it and
+    // have its genuine visibility changes discarded.
+    syncRasterLayersToStore(fakeControl([]).control);
+    syncRasterLayersToStore(fakeControl([rasterInfo()]).control);
+    syncRasterLayersToStore(
+      fakeControl([rasterInfo({ state: rasterState({ visible: false }) })]).control,
+    );
+
+    assert.equal(useAppStore.getState().layers[0].visible, false);
+  });
+});
+
+describe("savedRasterState", () => {
+  it("round-trips the state persisted by createRasterStoreLayer", () => {
+    const state = rasterState({
+      mode: "single",
+      bands: [4],
+      rescale: [[100, 2000]],
+      colormap: "terrain",
+      reversed: false,
+      nodata: "off",
+      gamma: 1.4,
+      stretch: "log",
+    });
+    const layer = createRasterStoreLayer(rasterInfo({ state }));
+
+    assert.deepEqual(savedRasterState(layer), {
+      mode: "single",
+      bands: [4],
+      rescale: [[100, 2000]],
+      colormap: "terrain",
+      reversed: false,
+      nodata: "off",
+      gamma: 1.4,
+      stretch: "log",
+    });
+  });
+
+  it("round-trips the auto-rescale (null) state explicitly", () => {
+    const layer = createRasterStoreLayer(rasterInfo({ state: rasterState({ rescale: null }) }));
+
+    assert.equal(savedRasterState(layer).rescale, null);
+  });
+
+  it("round-trips index mode and the preset id", () => {
+    const state = rasterState({
+      mode: "index",
+      bands: [4, 3],
+      index: "ndvi",
+      colormap: "rdylgn",
+      rescale: [[-1, 1]],
+    });
+    const layer = createRasterStoreLayer(rasterInfo({ state }));
+
+    const saved = savedRasterState(layer);
+    assert.equal(saved.mode, "index");
+    assert.equal(saved.index, "ndvi");
+    assert.deepEqual(saved.bands, [4, 3]);
+    assert.equal(saved.colormap, "rdylgn");
+  });
+
+  it("drops malformed fields from hand-edited project files", () => {
+    const layer = createRasterStoreLayer(rasterInfo());
+    layer.metadata.rasterState = {
+      mode: "sepia",
+      bands: [0, -1],
+      rescale: [],
+      colormap: 42,
+      nodata: "sometimes",
+      gamma: 0,
+      stretch: "cubic",
+    };
+
+    assert.deepEqual(savedRasterState(layer), {});
+  });
+
+  it("returns no overrides when the metadata is missing", () => {
+    const layer = createRasterStoreLayer(rasterInfo());
+    delete layer.metadata.rasterState;
+    assert.deepEqual(savedRasterState(layer), {});
+  });
+});

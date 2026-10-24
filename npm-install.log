@@ -1,0 +1,13 @@
+npm warn deprecated node-domexception@1.0.0: Use your platform's native DOMException instead
+npm warn deprecated google-p12-pem@3.1.4: Package is no longer maintained
+npm warn deprecated glob@11.1.0: Old versions of glob are not supported, and contain widely publicized security vulnerabilities, which have been fixed in the current version. Please update. Support for old versions may be purchased (at exorbitant rates) by contacting i@izs.me
+
+> geolibre@3.4.0 postinstall
+> node scripts/apply-dependency-patches.mjs
+
+patch-package 8.0.1
+Applying patches...
+@cogeotiff/core@9.5.0 ✔
+
+added 1787 packages in 3m
+INSTALL_EXIT=0

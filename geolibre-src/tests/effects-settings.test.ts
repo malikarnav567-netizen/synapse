@@ -1,0 +1,112 @@
+import assert from "node:assert/strict";
+import { describe, it } from "node:test";
+import { DECK_CANVAS_CLASS } from "maplibre-gl-lidar";
+import {
+  DEFAULT_EFFECTS_SETTINGS,
+  HALO_EXTENT_MAX,
+  HALO_EXTENT_MIN,
+  HALO_OPACITY_MAX,
+  HALO_OPACITY_MIN,
+  effectsOverlayCss,
+  nextEffectsFrameTime,
+  normalizeEffectsSettings,
+} from "../packages/plugins/src/plugins/maplibre-effects";
+
+describe("normalizeEffectsSettings", () => {
+  it("returns the defaults for undefined/empty input", () => {
+    assert.deepEqual(normalizeEffectsSettings(undefined), DEFAULT_EFFECTS_SETTINGS);
+    assert.deepEqual(normalizeEffectsSettings({}), DEFAULT_EFFECTS_SETTINGS);
+  });
+
+  it("prefixes a missing '#' and lowercases hex", () => {
+    const result = normalizeEffectsSettings({
+      haloColor: "ff0000",
+      spaceColor: "#00FF00",
+    });
+    assert.equal(result.haloColor, "#ff0000");
+    // Uppercase is lowercased so casing can't read as a non-default value.
+    assert.equal(result.spaceColor, "#00ff00");
+  });
+
+  it("accepts shorthand 3-digit hex", () => {
+    assert.equal(normalizeEffectsSettings({ haloColor: "#abc" }).haloColor, "#abc");
+  });
+
+  it("falls back to the base color on an invalid hex", () => {
+    const result = normalizeEffectsSettings({ haloColor: "not-a-color" });
+    assert.equal(result.haloColor, DEFAULT_EFFECTS_SETTINGS.haloColor);
+  });
+
+  it("clamps the halo extent and opacity into range", () => {
+    assert.equal(normalizeEffectsSettings({ haloExtent: 99 }).haloExtent, HALO_EXTENT_MAX);
+    assert.equal(normalizeEffectsSettings({ haloExtent: 0 }).haloExtent, HALO_EXTENT_MIN);
+    assert.equal(normalizeEffectsSettings({ haloOpacity: 5 }).haloOpacity, HALO_OPACITY_MAX);
+    assert.equal(normalizeEffectsSettings({ haloOpacity: -1 }).haloOpacity, HALO_OPACITY_MIN);
+  });
+
+  it("ignores non-finite numbers, keeping the base value", () => {
+    const result = normalizeEffectsSettings({
+      haloExtent: Number.NaN,
+      haloOpacity: Infinity,
+    });
+    assert.equal(result.haloExtent, DEFAULT_EFFECTS_SETTINGS.haloExtent);
+    assert.equal(result.haloOpacity, DEFAULT_EFFECTS_SETTINGS.haloOpacity);
+  });
+
+  it("merges onto a supplied base instead of the defaults", () => {
+    const base = {
+      haloColor: "#111111",
+      haloExtent: 2,
+      haloOpacity: 0.5,
+      spaceColor: "#222222",
+    };
+    const result = normalizeEffectsSettings({ haloExtent: 3 }, base);
+    assert.equal(result.haloExtent, 3);
+    assert.equal(result.haloColor, "#111111");
+    assert.equal(result.spaceColor, "#222222");
+    assert.equal(result.haloOpacity, 0.5);
+  });
+});
+
+describe("nextEffectsFrameTime", () => {
+  it("keeps decorative frames one 60 FPS interval apart on high-refresh displays", () => {
+    let lastFrameTime = -Infinity;
+    const renderedAt: number[] = [];
+
+    for (let index = 0; index < 180; index += 1) {
+      const timestamp = index * (1000 / 90);
+      const nextFrameTime = nextEffectsFrameTime(timestamp, lastFrameTime);
+      if (nextFrameTime === null) continue;
+      renderedAt.push(nextFrameTime);
+      lastFrameTime = nextFrameTime;
+    }
+
+    assert.equal(renderedAt.length, 90);
+    for (let index = 1; index < renderedAt.length; index += 1) {
+      assert.ok(renderedAt[index] - renderedAt[index - 1] + 0.1 >= 1000 / 60);
+    }
+  });
+});
+
+describe("effectsOverlayCss", () => {
+  it("keeps the LiDAR point-cloud canvas above the basemap but below markers", () => {
+    const css = effectsOverlayCss();
+    const zIndexFor = (selector: string) => {
+      const rule = css.split("}").find((block) => block.includes(`.${selector}`));
+      assert.ok(rule, `no rule for .${selector}`);
+      const zIndex = /z-index:\s*(\d+)/.exec(rule);
+      assert.ok(zIndex, `no z-index for .${selector}`);
+      return Number(zIndex[1]);
+    };
+
+    // The deck.gl canvas the LiDAR plugin parks after the map canvas shares the
+    // canvas's z-index, so DOM order puts it above the basemap; markers (and
+    // the control container, which matches them) stay above the points. See
+    // opengeos/GeoLibre#2530. The selector is read from the class the package
+    // itself exports, so a rename upstream fails here instead of silently
+    // un-fixing the stacking.
+    const lidarCanvas = zIndexFor(DECK_CANVAS_CLASS);
+    const marker = zIndexFor("maplibregl-marker");
+    assert.ok(lidarCanvas < marker, `${lidarCanvas} should be below ${marker}`);
+  });
+});
