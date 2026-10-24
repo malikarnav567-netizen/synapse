@@ -253,6 +253,7 @@ function GlobePanel({ network }: { network: any }) {
     <section className="card mapcard">
       <div ref={holder} className="map" />
       <div className="mapnote mono">{note}</div>
+                <button onClick={() => window.open(window.location.href, "_blank")}>🗖</button>
       <div className="rim" />
     </section>
   );
