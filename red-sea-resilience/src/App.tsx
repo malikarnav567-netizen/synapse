@@ -1,4 +1,31 @@
 import { useEffect, useRef, useState, useSyncExternalStore } from 'react';
+
+// GeoLibre embed configuration
+const GEOLIBRE_EMBED_ORIGINS = (import.meta as any).env?.VITE_GEOLIBRE_EMBED_ORIGINS;
+let geoMapIFrame: HTMLIFrameElement | null = null;
+let geoMapClient: any = null;
+let geoMapReady = false;
+
+async function initGeoMap() {
+  if (geoMapReady) return;
+  const iframes = document.querySelectorAll('iframe[name="geolibre-embed"]');
+  if (iframes.length > 0) {
+    geoMapIFrame = iframes[0];
+    try {
+      const embedModule = await import('@geolibre/embed');
+      geoMapClient = await embedModule.connect(geoMapIFrame, { origin: GEOLIBRE_EMBED_ORIGINS });
+      geoMapReady = true;
+      // Earth texture preserved - embed uses configured base map, no changes
+    } catch (e) {
+      console.warn('GeoLibre embed init failed:', e);
+    }
+  }
+}
+
+function onMountGeoMap() {
+  initGeoMap();
+}
+
 import { useNet } from './store';
 import { deriveStatus, onStatusChange, probe, wallet } from './lib/tf';
 import { AGENTS } from './lib/engine';
@@ -52,6 +79,24 @@ const SEV: Record<string, string> = { low: 'Low', medium: 'Medium', high: 'High'
 export default function App() {
   const s = useNet();
   const status = useSyncExternalStore(onStatusChange, deriveStatus);
+
+  // Initialize GeoLibre embed on mount
+  useEffect(() => {
+    onMountGeoMap();
+    const shownInterval = setInterval(() => onMountGeoMap(), 1000);
+    return () => clearInterval(shownInterval);
+  }, []);
+
+  // Render GeoLibre map as iframe embed
+  useEffect(() => {
+    const iframe = document.createElement('iframe');
+    iframe.name = 'geolibre-embed';
+    iframe.style.display = 'none';
+    iframe.src = 'http://127.0.0.1:5173';
+    iframe.sandbox = 'allow-scripts allow-same-origin allow-popups allow-forms allow-modals';
+    document.body.appendChild(iframe);
+    return () => document.body.removeChild(iframe);
+  }, []);
   const [ready, setReady] = useState(false); const [shown, setShown] = useState(false); const [credits, setCredits] = useState('—');
   const fired = useRef(false); const feed = useRef<HTMLDivElement>(null);
   const { phase, decision: d, events, network } = s;
