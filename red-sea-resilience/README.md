@@ -92,6 +92,22 @@ MapLibre (~1.08 MB, 294 kB gzip) is a lazy chunk: the console shell is 203 kB
 waits on the globe. Telemetry costs two requests per minute (air + marine, both
 Open-Meteo, batched across vessels), and the urgent path costs none.
 
+## Tests
+
+`npm test` runs 52 headless tests with node's built-in runner (no extra
+dependency) against the same modules the console uses:
+
+| Suite | Covers |
+| --- | --- |
+| `tests/predict.test.ts` | time-to-limit solver, urgent/predictive disjointness, ordering, one-case-per-device, fleet consolidation |
+| `tests/net.test.ts` | tier deadlines, retries, the three-strike breaker and its urgent bypass, live p50/p95 |
+| `tests/budget.test.ts` | hourly cap, TTL expiry, in-flight dedupe, a rejected call not poisoning the cache |
+| `tests/iot.test.ts` | two batched upstream calls for the whole fleet, degraded/stale fallback, dummy mode never fetching, thermal stability over 40 ticks |
+| `tests/geo.test.ts` | great-circle distances, densify/resample/morph, the antimeridian, that the Cape really is longer than Suez |
+| `tests/tf-guard.test.ts` | dummy mode and an exhausted budget both refuse *before* the network |
+
+`npm run typecheck` covers `src`, `server` and `tests`.
+
 ## Deploy (Vercel)
 
 The live project is `synapse1-kappa` → https://synapse1-kappa-gamma.vercel.app.
@@ -105,14 +121,14 @@ The live project is `synapse1-kappa` → https://synapse1-kappa-gamma.vercel.app
 3. There must be no `vercel.json` at the repo root: it would be picked up
    instead of the one in this folder and its `npm install --prefix ...` would
    run inside the already-rooted directory and fail with exit 254.
-3. `api/tf/[...path].ts` must stay self-contained. Vercel does not bundle imports
+4. `api/tf/[...path].ts` must stay self-contained. Vercel does not bundle imports
    from outside `api/` (a `../../server/...` import fails at runtime with
    `ERR_MODULE_NOT_FOUND`), and plain `api` functions only match a single path
    segment — `vercel.json` rewrites deeper paths back to the function.
-4. Open-Meteo needs no key and is called straight from the browser (CORS `*`), so
+5. Open-Meteo needs no key and is called straight from the browser (CORS `*`), so
    telemetry works even when the TinyFish wallet is empty.
-5. MapTiler key is optional: without it the globe falls back to a keyless CARTO
-   basemap and then to a plain schematic.
+6. `VITE_MAPLIBRE_KEY` is optional: without it the globe falls back to a keyless
+   CARTO basemap and then to a plain schematic.
 
 Sanity check after deploying:
 
