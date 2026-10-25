@@ -96,10 +96,15 @@ Open-Meteo, batched across vessels), and the urgent path costs none.
 
 The live project is `synapse1-kappa` → https://synapse1-kappa-gamma.vercel.app.
 
-1. Deploy **from this folder**, not the repo root, so the `api/` function ships:
+1. Deploy **from the repo root**, not from this folder. The Vercel project has
+   `Root Directory = red-sea-resilience`, so the upload must contain that
+   directory and the build then runs with this folder's own `vercel.json`:
    `vercel deploy --prod --project synapse1-kappa`
 2. `TINYFISH_API_KEY` must exist in Production, Preview and Development. Env
    changes only apply to **new** deployments, so redeploy after adding it.
+3. There must be no `vercel.json` at the repo root: it would be picked up
+   instead of the one in this folder and its `npm install --prefix ...` would
+   run inside the already-rooted directory and fail with exit 254.
 3. `api/tf/[...path].ts` must stay self-contained. Vercel does not bundle imports
    from outside `api/` (a `../../server/...` import fails at runtime with
    `ERR_MODULE_NOT_FOUND`), and plain `api` functions only match a single path
