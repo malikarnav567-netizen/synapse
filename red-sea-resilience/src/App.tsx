@@ -1,347 +1,26 @@
-import { useCallback, useEffect, useRef, useState, useSyncExternalStore } from 'react';
-import maplibregl from 'maplibre-gl';
-import 'maplibre-gl/dist/maplibre-gl.css';
+import { useCallback, useEffect, useRef, useState, lazy, Suspense } from 'react';
 
 import { useNet } from './store';
 import { deriveStatus, onStatusChange, probe, wallet } from './lib/tf';
-import { AGENTS } from './lib/engine';
-
-/* ---------- bento primitives (same language as Finance Bento) ---------- */
-const GR: Record<string, string[]> = {
-  blue: ['#b9a6ff', '#2e43ff', '#6d7dff', '#05082a'],
-  graph: ['#9a9aa8', '#3a3a44', '#55555f', '#060608'],
-  pink: ['#ffb3d6', '#ff2a85', '#ff6aa8', '#3a031c'],
-  copper: ['#f6bf96', '#c2683a', '#dc8a5c', '#1d0b05'],
-  green: ['#a6e8c8', '#36956f', '#58b58c', '#061d15'],
-  lime: ['#f4ffb8', '#a3c400', '#c9e03a', '#121700'],
-};
-
-type CardProps = {
-  id?: string;
-  className?: string;
-  tone?: string;
-  style?: React.CSSProperties;
-  children?: React.ReactNode;
-};
-
-const Card = ({ id, className = '', tone, style, children }: CardProps) => {
-  const c = tone ? GR[tone] : undefined;
-  return (
-    <section className={`card ${className}${c ? '' : ' glass'}`} id={id} style={style}>
-      {c && (
-        <>
-          <div
-            className="g"
-            style={{ background: `linear-gradient(180deg,${c[0]} 0%,${c[1]} 36%,${c[1]} 74%,${c[2]} 100%)` }}
-          />
-          <div className="core" style={{ background: c[3] }} />
-        </>
-      )}
-      <div className="in-c">{children}</div>
-      <div className="rim" />
-    </section>
-  );
-};
-
-const F: Record<string, string[]> = {
-  '0': ['01110', '10001', '10011', '10101', '11001', '10001', '01110'],
-  '1': ['00100', '01100', '00100', '00100', '00100', '00100', '01110'],
-  '2': ['01110', '10001', '00001', '00010', '00100', '01000', '11111'],
-  '3': ['11111', '00010', '00100', '00010', '00001', '10001', '01110'],
-  '4': ['00010', '00110', '01010', '10010', '11111', '00010', '00010'],
-  '5': ['11111', '10000', '11110', '00001', '00001', '10001', '01110'],
-  '6': ['00110', '01000', '10000', '11110', '10001', '10001', '01110'],
-  '7': ['11111', '00001', '00010', '00100', '01000', '01000', '01000'],
-  '8': ['01110', '10001', '10001', '01110', '10001', '10001', '01110'],
-  '9': ['01110', '10001', '10001', '01111', '00001', '00010', '01100'],
-  '.': ['0', '0', '0', '0', '0', '0', '1'],
-  '+': ['00000', '00100', '00100', '11111', '00100', '00100', '00000'],
-  '-': ['00000', '00000', '00000', '11111', '00000', '00000', '00000'],
-  ' ': ['00', '00', '00', '00', '00', '00', '00'],
-};
-
-function DotNum({ text, pitch = 7 }: { text: string; pitch?: number }) {
-  const cells: number[][] = [];
-  let x = 0;
-  for (const ch of text) {
-    const g = F[ch] || F[' '];
-    for (let r = 0; r < 7; r++) for (let k = 0; k < g[0].length; k++) if (g[r][k] === '1') cells.push([x + k, r]);
-    x += g[0].length + 1;
-  }
-  return (
-    <svg className="dots" width={Math.max(1, x - 1) * pitch} height={7 * pitch} role="img" aria-label={text}>
-      {cells.map(([c, r], i) => (
-        <circle key={i} cx={c * pitch + pitch / 2} cy={r * pitch + pitch / 2} r={pitch * 0.36} fill="#fff" />
-      ))}
-    </svg>
-  );
-}
-
-function useCount(to: number, dur = 900) {
-  const [v, setV] = useState(0);
-  const cur = useRef(0);
-  useEffect(() => {
-    const from = cur.current;
-    const t0 = performance.now();
-    let id = 0;
-    const f = (n: number) => {
-      const t = Math.min(1, (n - t0) / dur);
-      cur.current = from + (to - from) * (1 - Math.pow(1 - t, 3));
-      setV(cur.current);
-      if (t < 1) id = requestAnimationFrame(f);
-    };
-    id = requestAnimationFrame(f);
-    return () => cancelAnimationFrame(id);
-  }, [to, dur]);
-  return v;
-}
-
-const Ticks = ({ frac, n = 36 }: { frac: number; n?: number }) => (
-  <svg className="ticks" height="22" viewBox={`0 0 ${n * 8} 22`} preserveAspectRatio="none" aria-hidden="true">
-    {Array.from({ length: n }, (_, i) => (
-      <line
-        key={i}
-        x1={i * 8 + 2}
-        x2={i * 8 + 2}
-        y1={i % 6 === 0 ? 2 : 8}
-        y2="20"
-        stroke={i / (n - 1) <= frac ? '#E8FF1F' : 'rgba(255,255,255,.28)'}
-        strokeWidth="1.6"
-        strokeLinecap="round"
-        style={{ transition: `stroke .2s ${i * 14}ms` }}
-      />
-    ))}
-  </svg>
-);
-
-const safeUrl = (u: string) => (/^https?:\/\//i.test(u) ? u : undefined);
-const SEV: Record<string, string> = { low: 'Low', medium: 'Medium', high: 'High', critical: 'Critical' };
-
-/* ---------- map ---------- */
-const laneCollection = (net: any) => ({
-  type: 'FeatureCollection' as const,
-  features: net.lanes.map((l: any) => ({
-    type: 'Feature' as const,
-    properties: { id: l.id, name: l.name, status: l.status },
-    geometry: { type: 'LineString' as const, coordinates: l.geometry },
-  })),
-});
-
-const vesselCollection = (net: any) => ({
-  type: 'FeatureCollection' as const,
-  features: net.vessels.map((v: any) => {
-    const lane = net.lanes.find((l: any) => l.id === v.laneId);
-    const g: number[][] = lane?.geometry ?? [[43, 15]];
-    const p = g[Math.min(g.length - 1, Math.floor(g.length * 0.6))];
-    return {
-      type: 'Feature' as const,
-      properties: { id: v.id, route: v.route, cargo: v.cargo },
-      geometry: { type: 'Point' as const, coordinates: p },
-    };
-  }),
-});
-
-const MAPTILER_KEY = (import.meta as any).env?.VITE_MAPLIBRE_KEY as string | undefined;
-// Keyless fallbacks so the globe still renders when the MapTiler key is rejected.
-const FALLBACK_STYLE = 'https://basemaps.cartocdn.com/gl/dark-matter-gl-style/style.json';
-const SCHEMATIC_STYLE: any = {
-  version: 8,
-  sources: {},
-  layers: [{ id: 'bg', type: 'background', paint: { 'background-color': '#05070c' } }],
-};
-
-function GlobePanel({ network, onReady }: { network: any; onReady?: () => void }) {
-  const holder = useRef<HTMLDivElement>(null);
-  const mapRef = useRef<maplibregl.Map | null>(null);
-  const netRef = useRef(network);
-  const readyRef = useRef(false);
-  const onReadyRef = useRef(onReady);
-  const [note, setNote] = useState('Loading globe…');
-
-  onReadyRef.current = onReady;
-
-  netRef.current = network;
-
-  useEffect(() => {
-    const holderEl = holder.current;
-    if (!holderEl || mapRef.current) return;
-
-    let disposed = false;
-    let map: maplibregl.Map | null = null;
-    let resize: (() => void) | null = null;
-    let ro: ResizeObserver | null = null;
-    let readyTimer: number | undefined;
-
-    // Check the MapTiler style before the map exists: calling setStyle while a
-    // style is still loading leaves MapLibre stuck and 'style.load' never fires.
-    const preflight = async (): Promise<any> => {
-      if (!MAPTILER_KEY) return FALLBACK_STYLE;
-      try {
-        const r = await fetch(`https://api.maptiler.com/maps/basic/style.json?key=${MAPTILER_KEY}`, { signal: AbortSignal.timeout(5000) });
-        return r.ok ? `https://api.maptiler.com/maps/basic/style.json?key=${MAPTILER_KEY}` : FALLBACK_STYLE;
-      } catch {
-        return FALLBACK_STYLE;
-      }
-    };
-
-    const installLayers = () => {
-      if (!map) return;
-      if (!map.getSource('lanes')) {
-        map.addSource('lanes', { type: 'geojson', data: laneCollection(netRef.current) as any });
-        map.addLayer({
-          id: 'lanes-glow',
-          type: 'line',
-          source: 'lanes',
-          layout: { 'line-join': 'round', 'line-cap': 'round' },
-          paint: { 'line-color': '#00ffaa', 'line-width': 7, 'line-opacity': 0.16, 'line-blur': 4 },
-        });
-        map.addLayer({
-          id: 'lanes',
-          type: 'line',
-          source: 'lanes',
-          layout: { 'line-join': 'round', 'line-cap': 'round' },
-          paint: {
-            'line-color': ['match', ['get', 'status'], 'rerouted', '#E8FF1F', '#00ffaa'],
-            'line-width': 2,
-            'line-opacity': 0.9,
-          },
-        });
-      }
-
-      if (!map.getSource('vessels')) {
-        map.addSource('vessels', { type: 'geojson', data: vesselCollection(netRef.current) as any });
-        map.addLayer({
-          id: 'vessels',
-          type: 'circle',
-          source: 'vessels',
-          paint: {
-            'circle-color': ['match', ['get', 'route'], 'cape', '#E8FF1F', '#ff6b6b'],
-            'circle-radius': 4.5,
-            'circle-stroke-color': '#ffffff',
-            'circle-stroke-width': 1,
-          },
-        });
-      }
-    };
-
-    const markReady = () => {
-      if (readyRef.current) return;
-      readyRef.current = true;
-      window.clearTimeout(readyTimer);
-      onReadyRef.current?.();
-    };
-
-    const create = (style: any) => {
-      if (disposed) return;
-      try {
-        map = new maplibregl.Map({
-          container: holderEl,
-          style,
-          center: [40, 19],
-          zoom: 1.55,
-          pitch: 28,
-          bearing: 0,
-          maxPitch: 85,
-          canvasContextAttributes: { antialias: true },
-          attributionControl: { compact: true },
-        });
-      } catch {
-        setNote('WebGL unavailable — schematic only');
-        return;
-      }
-
-      mapRef.current = map;
-      map.addControl(new maplibregl.NavigationControl({ visualizePitch: true }), 'bottom-right');
-
-      let fellBackToSchematic = false;
-      map.on('error', () => {
-        // Tiles can fail after the style is live; that is not fatal.
-        if (!map || map.isStyleLoaded() || fellBackToSchematic) return;
-        fellBackToSchematic = true;
-        setNote('Basemap unavailable — schematic view');
-        // Wait for the failed load to settle: swapping mid-load wedges MapLibre.
-        window.setTimeout(() => {
-          if (!disposed && map && !map.isStyleLoaded()) map.setStyle(SCHEMATIC_STYLE);
-        }, 1200);
-      });
-
-      map.on('style.load', () => {
-        if (!map) return;
-        setNote(style === SCHEMATIC_STYLE ? 'Schematic view' : '');
-        try {
-          (map as any).setProjection({ type: 'globe' });
-          // Atmosphere sells the sphere; ignored by older builds.
-          (map as any).setSky?.({
-            'sky-color': '#0a1224',
-            'horizon-color': '#1b2a4a',
-            'fog-color': '#05070c',
-            'sky-horizon-blend': 0.6,
-            'horizon-fog-blend': 0.55,
-            'fog-ground-blend': 0.9,
-          });
-        } catch {
-          /* older maplibre builds: flat map */
-        }
-        installLayers();
-        // Settle the camera so the globe reads as a sphere inside the card.
-        map.easeTo({ pitch: 28, duration: 0 });
-        markReady();
-      });
-    };
-
-    void (async () => {
-      const style = await preflight();
-      if (disposed) return;
-      create(style);
-      // Never leave the demo locked if a style silently stalls.
-      readyTimer = window.setTimeout(() => {
-        if (!readyRef.current && map?.getCanvas()) {
-          setNote(note => note || 'Basemap loading — schematic lanes only');
-          markReady();
-        }
-      }, 9000);
-    })();
-
-    // The card is responsive; keep the canvas in sync when the layout changes.
-    resize = () => mapRef.current?.resize();
-    window.addEventListener('resize', resize);
-    ro = typeof ResizeObserver !== 'undefined' ? new ResizeObserver(() => resize?.()) : null;
-    ro?.observe(holderEl);
-
-    return () => {
-      disposed = true;
-      window.clearTimeout(readyTimer);
-      if (resize) window.removeEventListener('resize', resize);
-      ro?.disconnect();
-      map?.remove();
-      mapRef.current = null;
-    };
-  }, []);
-
-  useEffect(() => {
-    const map = mapRef.current;
-    if (!map || !map.isStyleLoaded()) return;
-    const lanes = map.getSource('lanes') as maplibregl.GeoJSONSource | undefined;
-    const vessels = map.getSource('vessels') as maplibregl.GeoJSONSource | undefined;
-    lanes?.setData(laneCollection(network) as any);
-    vessels?.setData(vesselCollection(network) as any);
-  }, [network]);
-
-  return (
-    <section className="card mapcard">
-      <div ref={holder} className="map" />
-      <div className="mapbadge mono">Demo fleet · AIS simulated</div>
-      <div className="mapnote mono">{note}</div>
-      <button className="mapopen" onClick={() => window.open(window.location.href, '_blank')} aria-label="Open in new tab">🗖</button>
-      <div className="rim" />
-    </section>
-  );
-}
+import { AGENTS, ZONE, intersectsZone } from './lib/engine';
+import { pathNm, type LonLat } from './lib/geo';
+import { budgetSnapshot, onBudgetChange, clearCache, type BudgetSnapshot } from './lib/budget';
+import { netSnapshot, onNetChange, type NetSnapshot } from './lib/net';
+import { getMode, onModeChange, setMode, type DataMode } from './lib/mode';
+import { startTelemetry, useTelemetry } from './lib/telemetry';
+// The globe is 1 MB of MapLibre: stream it so the console paints first.
+const GlobePanel = lazy(() => import('./GlobePanel'));import CargoPanel from './CargoPanel';
+import CasesPanel from './CasesPanel';
+import { Card, DotNum, Ticks, useCount, safeUrl, SEV } from './ui';
 
 /* ---------- app ---------- */
 export default function App() {
   const s = useNet();
-  const status = useSyncExternalStore(onStatusChange, deriveStatus);
+  const [status, setStatus] = useState(deriveStatus);
+  const [budget, setBudget] = useState<BudgetSnapshot>(budgetSnapshot);
+  const [net, setNet] = useState<NetSnapshot>(netSnapshot);
+  const [mode, setModeState] = useState<DataMode>(getMode());
+  const summary = useTelemetry(t => t.summary);
 
   const { phase, decision: d, events, network } = s;
   const sum = d?.summary;
@@ -357,37 +36,70 @@ export default function App() {
   // Simulations wait for the probe and the first map style so lanes exist first.
   const armed = ready && mapReady;
 
+  useEffect(() => onStatusChange(() => setStatus(deriveStatus())), []);
+  useEffect(() => onBudgetChange(() => setBudget(budgetSnapshot())), []);
+  useEffect(() => onNetChange(() => setNet(netSnapshot())), []);
+  useEffect(() => onModeChange(() => setModeState(getMode())), []);
+
   useEffect(() => {
     probe().finally(() => setReady(true));
     const t = setTimeout(() => setShown(true), 30);
     return () => clearTimeout(t);
   }, []);
 
+  // Telemetry restarts on a mode change so the first sample already has the
+  // right provenance (live request vs seeded dummy) instead of a stale chip.
+  useEffect(() => startTelemetry(() => useNet.getState().network), [mode]);
+
   // ?simulate fires once, only when ready (no cleanup: StrictMode double-runs effects)
   useEffect(() => {
     if (!armed || fired.current || !location.search.includes('simulate')) return;
     fired.current = true;
-    setTimeout(() => useNet.getState().simulate(), 1500);
+    setTimeout(() => useNet.getState().simulate(), 1200);
   }, [armed]);
 
   useEffect(() => {
-    if (!ready || status === 'NOT_CONFIGURED') return;
+    if (!ready || status === 'NOT_CONFIGURED' || mode === 'dummy') return;
     wallet()
       .then((w: any) => {
-        const v = w?.credits ?? w?.balance ?? w?.remaining ?? w?.credits_remaining;
-        if (v != null) setCredits(String(v));
+        const v = w?.available_balance ?? w?.credits ?? w?.balance ?? w?.remaining ?? w?.credits_remaining;
+        if (v != null) {
+          const n = Number(v);
+          setCredits(Number.isFinite(n) ? `$${n.toFixed(2)}` : String(v));
+        }
       })
       .catch(() => {});
-  }, [ready, status, phase]);
+  }, [ready, status, phase, mode]);
 
   useEffect(() => {
     feed.current?.scrollTo({ top: feed.current.scrollHeight, behavior: 'smooth' });
   }, [events.length]);
 
-  const lanesN = useCount(sum?.lanes ?? 0);
-  const vesN = useCount(sum?.vessels ?? 0);
-  const dayN = useCount(sum?.extraDays ?? 0);
+  const switchMode = (next: DataMode) => {
+    if (next === mode) return;
+    clearCache();                       // a dummy run must never serve live cache
+    setMode(next);
+  };
+
+  /* ---------- live network figures (not decision-only) ---------- */
+  const riskLanes = (network.lanes as any[]).filter((l: any) => intersectsZone(l.geometry as LonLat[], ZONE));
+  const riskIds = new Set(riskLanes.map((l: any) => l.id));
+  const eligible = (network.vessels as any[]).filter(v => riskIds.has(v.laneId) && v.rerouteEligible && v.route === 'suez');
+  const liveExtraDays = eligible.reduce((m, v: any) => {
+    const lane: any = network.lanes.find((l: any) => l.id === v.laneId);
+    if (!lane?.alternate) return m;
+    const extra = pathNm(lane.alternate) - pathNm(lane.geometry);
+    return Math.max(m, extra / (14 * 24));
+  }, 0);
+  const liveSlack = (network.vessels as any[])
+    .filter(v => riskIds.has(v.laneId))
+    .reduce((m, v: any) => Math.min(m, v.deliveryWindowDays - v.remainingDays - (v.route === 'cape' ? v.extraDays : eligible.some(e => e.id === v.id) ? liveExtraDays : 0)), Infinity);
+
+  const lanesN = useCount(sum?.lanes ?? riskLanes.length);
+  const vesN = useCount(sum?.vessels ?? eligible.length);
+  const dayN = useCount(sum?.extraDays ?? liveExtraDays);
   const conf = useCount((d?.confidence ?? 0) * 100);
+  const slackLive = sum?.slackDays ?? (Number.isFinite(liveSlack) ? liveSlack : 0);
 
   const evidence = [...(d?.evidence ?? []), ...s.extra].filter((e: any) => e.sourceUrl && e.retrievedAt);
   const label = status === 'CONNECTED' ? 'Live' : status === 'DEGRADED' ? 'Degraded' : 'Local Fallback';
@@ -408,12 +120,20 @@ export default function App() {
       <div className={`canvas ${shown ? 'in' : ''}`}>
         <div className="top">
           <h1>
-            Red Sea Resilience
+            Synapse
             <span>{phase === 'REROUTED' ? 'Reroute applied' : 'Cold-chain disruption control'}</span>
           </h1>
           <div className="ctrls">
+            <div className="seg" role="group" aria-label="Data source">
+              <button className={mode === 'live' ? 'on' : ''} aria-pressed={mode === 'live'} onClick={() => switchMode('live')}>
+                Live data
+              </button>
+              <button className={mode === 'dummy' ? 'on' : ''} aria-pressed={mode === 'dummy'} onClick={() => switchMode('dummy')}>
+                Dummy
+              </button>
+            </div>
             <div className="seg" role="group" aria-label="Actions">
-              <button className="pri" disabled={phase !== 'IDLE' || !armed} onClick={() => s.simulate()} title={armed ? undefined : 'Waiting for map and status checks' }>
+              <button className="pri" disabled={phase !== 'IDLE' || !armed} onClick={() => s.simulate()} title={armed ? undefined : 'Waiting for map and status checks'}>
                 Simulate disruption
               </button>
               <button className="pri" disabled={phase !== 'AWAITING_APPROVAL'} onClick={() => s.approve()}>
@@ -424,15 +144,23 @@ export default function App() {
               </button>
             </div>
             <div className="seg">
-              <button disabled aria-label="TinyFish status" title={`TinyFish: ${status.replace('_', ' ')}`}>
-                TinyFish: {status === 'CONNECTED' ? 'Live' : status === 'DEGRADED' ? 'Degraded' : 'Local Fallback'}
+              <button disabled aria-label="TinyFish status" title={`TinyFish: ${status.replace('_', ' ')} · ${budget.spent}/${budget.cap} calls this hour`}>
+                {mode === 'dummy' ? 'Dummy data' : `TinyFish: ${status === 'CONNECTED' ? 'Live' : status === 'DEGRADED' ? 'Degraded' : 'Local Fallback'}`}
               </button>
             </div>
           </div>
         </div>
 
         <div className="grid">
-          <GlobePanel network={network} onReady={handleMapReady} />
+          <Suspense fallback={<div className="card mapcard mapskel" aria-hidden="true" />}>
+            <GlobePanel
+              network={network}
+              phase={phase}
+              status={status}
+              evidence={evidence}
+              onReady={handleMapReady}
+            />
+          </Suspense>
 
           <Card id="feed" className="h1" tone="blue">
             <div className="row between">
@@ -507,7 +235,7 @@ export default function App() {
             <div className="kv">
               <DotNum text={String(Math.round(lanesN))} pitch={6} />
             </div>
-            <div className="muted dark foot">of {network.lanes.length} lanes</div>
+            <div className="muted dark foot">of {network.lanes.length} lanes · zone geometry</div>
           </Card>
 
           <Card id="k2" className="h2 kpi">
@@ -533,15 +261,22 @@ export default function App() {
 
           <Card id="k4" className="h2 kpi">
             <div className="row between">
-              <div className="cap">Cold-chain slack</div>
+              <div className="cap">Delivery slack</div>
               {sum && <span className={`chip risk-${sum.risk}`}>{sum.risk}</span>}
             </div>
             <div className="kv">
-              <span className="big mono">{sum ? sum.slackDays.toFixed(1) : '—'}</span>
+              <span className="big mono">{slackLive.toFixed(1)}</span>
               <span className="muted"> days</span>
             </div>
-            <Ticks frac={sum ? Math.max(0, Math.min(1, sum.slackDays / 10)) : 0} />
+            <Ticks frac={Math.max(0, Math.min(1, slackLive / 10))} />
+            <div className="muted foot mono">
+              {summary ? `${summary.breaches} box${summary.breaches === 1 ? '' : 'es'} over limit · live sensors` : 'IoT feed pending'}
+            </div>
           </Card>
+
+          <CargoPanel mode={mode} />
+          <CasesPanel kind="urgent" />
+          <CasesPanel kind="predictive" />
 
           <Card id="evid" className="h3" tone="pink">
             <div className="row between">
@@ -556,9 +291,11 @@ export default function App() {
             <div className="scroll low">
               {!evidence.length && (
                 <p className="muted pad">
-                  {d
-                    ? 'No external evidence retrieved. This assessment is modelled locally.'
-                    : 'Sources appear here with their link and retrieval time.'}
+                  {mode === 'dummy'
+                    ? 'Dummy mode: TinyFish is bypassed, so this stays empty by design.'
+                    : d
+                      ? 'No external evidence retrieved. This assessment is modelled locally.'
+                      : 'Sources appear here with their link and retrieval time.'}
                 </p>
               )}
               {evidence.map((e: any) => (
@@ -608,17 +345,28 @@ export default function App() {
             <div className="row between">
               <div className="ttl">Fleet</div>
               <span className="chips">
-                <span className="chip demo">Demo fleet</span>
-                <span className="chip">{status === 'CONNECTED' ? 'Live TinyFish' : label}</span>
+                <span className="chip glasschip mono" title="Paid TinyFish calls this hour / cache hits">
+                  TF {budget.spent}/{budget.cap}
+                </span>
+                <span className="chip glasschip mono" title="Answers served from cache">
+                  ⚡{budget.saved}
+                </span>
               </span>
             </div>
             <div className="sysrow">
               <span className="cap">TinyFish</span>
-              <span className="mono">{label}</span>
+              <span className="mono">{mode === 'dummy' ? 'Off (dummy)' : label}</span>
             </div>
             <div className="sysrow">
               <span className="cap">Credits left</span>
-              <span className="mono">{credits}</span>
+              <span className="mono">{mode === 'dummy' ? '—' : credits}</span>
+            </div>
+            <div className="sysrow">
+              <span className="cap">Sensor API p95</span>
+              <span className="mono">
+                {net.p95 ? `${net.p95} ms` : '—'}
+                {net.timeouts ? ` · ${net.timeouts} timeout${net.timeouts === 1 ? '' : 's'}` : ''}
+              </span>
             </div>
             <div className="fleet">
               {network.vessels.map((v: any) => (

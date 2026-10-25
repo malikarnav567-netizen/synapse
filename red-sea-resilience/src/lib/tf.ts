@@ -1,3 +1,7 @@
+import { memo, charge } from './budget';
+import { isDummy } from './mode';
+import { recordCacheHit } from './net';
+
 export interface Evidence { id: string; provider: 'search'|'fetch'|'research'|'agent'|'browser'|'local'; title: string; sourceUrl: string; retrievedAt: string; publishedAt?: string; summary: string; confidence: number }
 export interface AgentResult<T> { status: 'ok'|'degraded'|'failed'|'cancelled'; data: T; evidence: Evidence[]; warnings: string[] }
 export interface AgentRunEvent { runId: string; seq: number; ts: string; agent: string; level: 'info'|'warn'|'error'; message: string; source: 'local'|'tinyfish' }
@@ -33,6 +37,8 @@ const sleep = (ms: number, s?: AbortSignal) => new Promise<void>((res, rej) => {
 });
 
 export async function tf<T>(path: string, init: RequestInit & { timeoutMs?: number; silent?: boolean } = {}, signal?: AbortSignal): Promise<T> {
+  // Dummy mode is a hard offline switch: no request, no spend, no half-state.
+  if (isDummy()) throw new TFError(451, 'DUMMY_MODE');
   const { timeoutMs, silent = false, ...rest } = init;
   const timeout = AbortSignal.timeout(timeoutMs ?? 12_000);
   const sig = signal ? AbortSignal.any([signal, timeout]) : timeout;
@@ -63,6 +69,12 @@ export async function tf<T>(path: string, init: RequestInit & { timeoutMs?: numb
 /* ---- services ---- */
 export interface SearchHit { title: string; snippet: string; url: string; date?: string; site_name?: string }
 const SEARCH_PURPOSE = 'Find current shipping advisories about Red Sea transit for a cold-chain risk assessment';
+/**
+ * Cache windows by question type — this is what keeps the wallet alive.
+ * Advisories move in hours, port notes in days, WHO storage rules in years.
+ */
+const SEARCH_TTL = { news: 15 * 60_000, general: 6 * 3.6e6, reference: 24 * 3.6e6 };
+
 export async function search(
   q: string,
   signal?: AbortSignal,
@@ -74,18 +86,49 @@ export async function search(
   const recency = opts.recencyMinutes === undefined ? (opts.news ? 1440 : 10080) : opts.recencyMinutes;
   if (recency != null) p.set('recency_minutes', String(recency));
   if (opts.news) p.set('domain_type', 'news');
-  const r = await tf<{ results: SearchHit[] }>(`/search?${p}`, { timeoutMs: 10_000 }, signal);
-  return r.results ?? [];
+
+  const ttl = opts.recencyMinutes === null ? SEARCH_TTL.reference : opts.news ? SEARCH_TTL.news : SEARCH_TTL.general;
+  const { value, hit } = await memo(`search:${p}`, ttl, async () => {
+    if (!charge()) throw new TFError(429, 'BUDGET_EXHAUSTED');
+    const r = await tf<{ results: SearchHit[] }>(`/search?${p}`, { timeoutMs: 9_000 }, signal);
+    return r.results ?? [];
+  });
+  if (hit) recordCacheHit('api.search.tinyfish.ai', '/search');
+  return value;
+}
+const portCache = new Map<string, SearchHit[]>();
+/** Port-level advisories for the globe popups (cached per session; search is free tier). */
+export async function portAdvisory(port: string, signal?: AbortSignal): Promise<SearchHit[]> {
+  const cached = portCache.get(port);
+  if (cached) return cached;
+  const hits = await search(`${port} port congestion strike vessel delay`, signal, {
+    purpose: `Find current port congestion, strike and berth delay advisories at ${port}`,
+    recencyMinutes: 20160,
+  });
+  const safe = hits.filter(h => /^https:\/\//.test(h.url)).slice(0, 3);
+  portCache.set(port, safe);
+  return safe;
 }
 export interface Page { url: string; final_url: string; title: string|null; description: string|null; published_date: string|null; text: string|null }
 export interface FetchOut { results: Page[]; errors: { url: string; error: string }[] }
-export const getContents = (urls: string[], signal?: AbortSignal) =>
-  tf<FetchOut>('/fetch', { method: 'POST', timeoutMs: 18_000, body: JSON.stringify({ urls: urls.slice(0, 3), format: 'markdown', ttl: 0, per_url_timeout_ms: 5000 }) }, signal);
+export const getContents = (urls: string[], signal?: AbortSignal) => {
+  const list = urls.slice(0, 3);
+  return memo(`fetch:${[...list].sort().join('|')}`, 6 * 3.6e6, async () => {
+    if (!charge()) throw new TFError(429, 'BUDGET_EXHAUSTED');
+    return tf<FetchOut>('/fetch', {
+      method: 'POST',
+      timeoutMs: 18_000,
+      body: JSON.stringify({ urls: list, format: 'markdown', ttl: 0, per_url_timeout_ms: 5000 }),
+    }, signal);
+  }).then(r => { if (r.hit) recordCacheHit('api.fetch.tinyfish.ai', '/fetch'); return r.value; });
+};
 
-export const startResearch = (query: string) => tf<{ research_run_id: string }>('/research/start', { method: 'POST', body: JSON.stringify({ query }), silent: true });
+export const startResearch = (query: string) =>
+  (charge() ? tf<{ research_run_id: string }>('/research/start', { method: 'POST', body: JSON.stringify({ query }), silent: true })
+            : Promise.reject(new TFError(429, 'BUDGET_EXHAUSTED')));
 export const getResearch = (id: string, signal?: AbortSignal) => tf<{ status: string; deep_result?: { result?: string; citations?: string[] } }>(`/research/${id}`, { silent: true }, signal);
 export const cancelResearch = (id: string) => tf(`/research/${id}/cancel`, { method: 'POST', silent: true }).catch(() => {});
-export const wallet = () => tf<any>('/wallet');
+export const wallet = () => memo('wallet', 60_000, () => tf<any>('/wallet')).then(r => r.value);
 
 export async function runAgent<T>(url: string, goal: string, output_schema: object, signal: AbortSignal, onProgress: (m: string) => void, onRunId: (id: string) => void): Promise<T> {
   const res = await fetch(BASE + '/agent/run-sse', { method: 'POST', signal, headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ url, goal, output_schema }) });

@@ -1,5 +1,7 @@
 import { search, getContents, startResearch, getResearch, capture, isConfigured } from './tf';
 import type { AgentResult, AgentRunEvent, Decision, Evidence } from './tf';
+import type { SensorSummary } from './iot';
+import { isDummy } from './mode';
 
 /* ---------- runtime ---------- */
 export interface RunCtx { runId: string; signal: AbortSignal; abort(): void; emit(agent: string, message: string, level?: AgentRunEvent['level'], source?: AgentRunEvent['source']): void; onCleanup(fn: () => void): void }
@@ -26,23 +28,22 @@ export async function stage<T>(ctx: RunCtx, ms: number, live: (s: AbortSignal) =
 const pause = (ctx: RunCtx, ms = 450) => new Promise<void>(r => setTimeout(r, ctx.signal.aborted ? 0 : ms));
 
 /* ---------- demo network ---------- */
-export type LonLat = [number, number];
-export const ZONE: LonLat[] = [[32, 12], [44, 12], [44, 30], [32, 30]];   // Red Sea / Bab-el-Mandeb
+import { SEA_LANES, ZONE, type LonLat } from './routes';
+export { ZONE } from './routes';
+export type { LonLat };
 const inZone = (p: LonLat, z: LonLat[]) => { let c = false; for (let i = 0, j = z.length - 1; i < z.length; j = i++) { const [xi, yi] = z[i], [xj, yj] = z[j]; if ((yi > p[1]) !== (yj > p[1]) && p[0] < ((xj - xi) * (p[1] - yi)) / (yj - yi) + xi) c = !c; } return c; };
 export const intersectsZone = (g: LonLat[], z: LonLat[]) => g.some(p => inZone(p, z));
 const rad = (d: number) => (d * Math.PI) / 180;
 const nm = (a: LonLat, b: LonLat) => { const dLat = rad(b[1] - a[1]), dLon = rad(b[0] - a[0]); const h = Math.sin(dLat / 2) ** 2 + Math.cos(rad(a[1])) * Math.cos(rad(b[1])) * Math.sin(dLon / 2) ** 2; return 2 * 3440.065 * Math.asin(Math.sqrt(h)); };
 const pathNm = (g: LonLat[]) => g.slice(1).reduce((s, p, i) => s + nm(g[i], p), 0);
-const CAPE: LonLat[] = [[62, -8], [40, -28], [20, -36], [3, -22], [-10, 0], [-20, 14.5], [-12, 37], [-6, 48.5]];
 const SPEED_KN = 14;
 
 export const buildNominalNetwork = () => ({
-  lanes: [
-    { id: 'L1', name: 'Mumbai → Rotterdam', geometry: [[72.8, 18.9], [60, 14], [43.3, 12.6], [38, 20], [32.5, 30], [15, 36], [4.1, 51.9]] as LonLat[], status: 'nominal' },
-    { id: 'L2', name: 'Colombo → Hamburg', geometry: [[79.8, 6.9], [60, 10], [43.5, 12.8], [35, 24], [32.4, 29.9], [10, 38], [9.9, 53.5]] as LonLat[], status: 'nominal' },
-    { id: 'L3', name: 'Jebel Ali → Felixstowe', geometry: [[55, 25], [58, 22], [43.4, 12.7], [34, 26], [32.4, 29.9], [10, 38], [1.3, 51.9]] as LonLat[], status: 'nominal' },
-    { id: 'L4', name: 'Shanghai → Los Angeles', geometry: [[121.5, 31], [180, 45], [-118, 33.7]] as LonLat[], status: 'nominal' },
-  ],
+  lanes: SEA_LANES.map(l => ({
+    ...l,
+    geometry: l.geometry.map(p => [...p] as LonLat),
+    alternate: l.alternate.map(p => [...p] as LonLat),
+  })),
   vessels: [
     { id: 'MV Aurora Pharma', laneId: 'L1', cargo: 'Vaccines, 2–8 °C', rerouteEligible: true, deliveryWindowDays: 33, remainingDays: 17, route: 'suez', extraDays: 0 },
     { id: 'MV Cold Meridian', laneId: 'L2', cargo: 'Insulin, 2–8 °C', rerouteEligible: true, deliveryWindowDays: 27, remainingDays: 19, route: 'suez', extraDays: 0 },
@@ -73,6 +74,7 @@ const host = (u: string) => { try { return new URL(u).hostname; } catch { return
 function intelligenceAgent(ctx: RunCtx) {
   const A = AGENTS[1];
   return stage<{ sources: number }>(ctx, 28_000, async (signal) => {
+    if (isDummy()) throw new Error('dummy mode');                     // offline demo: never call TinyFish
     if (!isConfigured()) throw new Error('tinyfish not configured');   // stay fully local until a key is set
     ctx.emit(A, `${A} started`);
     ctx.emit(A, 'TinySearch: gathering Red Sea transit advisories', 'info', 'tinyfish');
@@ -165,7 +167,7 @@ function intelligenceAgent(ctx: RunCtx) {
     ctx.emit(A, `${evidence.length} advisory sources verified`, 'info', 'tinyfish');
     return { status: 'ok' as const, data: { sources: evidence.length }, evidence, warnings: [] as string[] };
   }, () => {
-    ctx.emit(A, 'TinyFish unavailable — using local resilience model', 'warn');
+    ctx.emit(A, isDummy() ? 'Dummy mode — TinyFish bypassed, local model only' : 'TinyFish unavailable — using local resilience model', 'warn');
     ctx.emit(A, 'Assessment completed with limited external evidence', 'warn');
     return { status: 'degraded' as const, data: { sources: 0 }, evidence: [], warnings: ['local fallback'] };
   });
@@ -193,7 +195,7 @@ function writeResearch(cache: ResearchCache | null) {
 }
 
 async function watchResearch(ctx: RunCtx, onEvidence: (e: Evidence) => void) {
-  if (!isConfigured()) return;                        // no key → no background research call
+  if (isDummy() || !isConfigured()) return;           // offline demo / no key → no background research call
   const cached = readResearch();
   if (cached?.status === 'done' && cached.evidence) { onEvidence(cached.evidence); return; }   // quota-safe reuse
 
@@ -227,17 +229,27 @@ async function watchResearch(ctx: RunCtx, onEvidence: (e: Evidence) => void) {
 async function routePlanningAgent(ctx: RunCtx, det: { lanes: any[]; vessels: any[] }) {
   const A = AGENTS[2]; ctx.emit(A, `${A} started`);
   const plans = det.vessels.map(v => {
-    const g: LonLat[] = det.lanes.find(l => l.id === v.laneId).geometry;
-    const extraNm = pathNm([g[0], ...CAPE, g[g.length - 1]]) - pathNm(g);
-    return { vesselId: v.id, extraNm, extraDays: extraNm / (SPEED_KN * 24) };
+    const lane = det.lanes.find(l => l.id === v.laneId);
+    const suezNm = pathNm(lane.geometry);
+    const capeNm = lane.alternate && lane.alternate.length > 1 ? pathNm(lane.alternate) : suezNm;
+    const extraNm = Math.max(0, capeNm - suezNm);
+    return { vesselId: v.id, extraNm, extraDays: extraNm / (SPEED_KN * 24), suezNm, capeNm };
   });
   ctx.emit(A, 'Cape of Good Hope diversion generated');
   await pause(ctx);
   return { status: 'ok' as const, data: { plans }, evidence: [] as Evidence[], warnings: [] as string[] };
 }
 
-async function coldChainAgent(ctx: RunCtx, route: { plans: any[] }, net: Network) {
+async function coldChainAgent(ctx: RunCtx, route: { plans: any[] }, net: Network, sensors: SensorSummary | null) {
   const A = AGENTS[3]; ctx.emit(A, `${A} started`);
+  if (sensors) {
+    ctx.emit(A, `IoT gateway: ${sensors.devices} devices online · ambient ${sensors.ambientAvg} °C (${sensors.source}) · ${sensors.latencyMs} ms`,
+      'info', sensors.source === 'live' ? 'tinyfish' : 'local');
+    ctx.emit(A, `Sea state ${sensors.waveMax} m · coldest margin reviewed on ${sensors.reefers} reefers`);
+    if (sensors.breaches) {
+      ctx.emit(A, `${sensors.breaches} container${sensors.breaches === 1 ? '' : 's'} already above limit — hottest ${sensors.worstId} at ${sensors.worstC} °C`, 'warn');
+    }
+  }
   const checks = route.plans.map(p => {
     const v = net.vessels.find(x => x.id === p.vesselId)!;
     const slackDays = v.deliveryWindowDays - (v.remainingDays + p.extraDays);
@@ -245,15 +257,24 @@ async function coldChainAgent(ctx: RunCtx, route: { plans: any[] }, net: Network
   });
   const order = { low: 0, medium: 1, high: 2 } as any;
   const worst = checks.reduce((a, c) => (!a || c.slackDays < a.slackDays ? c : a), null as any);
-  const risk: 'low'|'medium'|'high' = checks.reduce((r, c) => (order[c.risk] > order[r] ? c.risk : r), 'low' as any);
-  ctx.emit(A, 'Cold-chain feasibility assessed');
+  let risk: 'low'|'medium'|'high' = checks.reduce((r, c) => (order[c.risk] > order[r] ? c.risk : r), 'low' as any);
+  // A live breach outranks a modelled slack number: the cargo is already out of spec.
+  if (sensors && sensors.breaches > 0 && risk === 'low') risk = 'high';
+  const slate = sensors?.source === 'live' ? 'live sensor slate' : sensors?.source === 'demo' ? 'demo sensor slate' : 'modelled sensor slate';
+  ctx.emit(A, sensors?.breaches
+    ? `Cold-chain feasibility assessed — ${risk} risk, ${sensors.breaches} breach${sensors.breaches === 1 ? '' : 'es'} on the ${slate}`
+    : `Cold-chain feasibility assessed on the ${slate}`);
   await pause(ctx);
-  return { status: 'ok' as const, data: { checks, worst, risk }, evidence: [] as Evidence[], warnings: [] as string[] };
+  return { status: 'ok' as const, data: { checks, worst, risk, sensors }, evidence: [] as Evidence[], warnings: [] as string[] };
 }
 
 async function recommendationAgent(ctx: RunCtx, r: { detect: any; intel: any; route: any; cold: any }) {
   const A = AGENTS[4]; ctx.emit(A, `${A} started`);
   const evidence: Evidence[] = r.intel.evidence;
+  const sensors = r.cold.data.sensors as SensorSummary | null;
+  const sensorLine = sensors
+    ? ` Live cargo feed: ${sensors.breaches} of ${sensors.reefers} reefers above limit, ambient ${sensors.ambientAvg} °C (${sensors.source}), swell ${sensors.waveMax} m.`
+    : '';
   const domains = new Set(evidence.map(e => host(e.sourceUrl)));
   const degraded = [r.intel, r.route, r.cold].some((x: any) => x.status !== 'ok');
   const confidence = degraded && !evidence.length ? 0.62 : Math.min(0.95, Math.max(0.3, 0.55 + 0.1 * Math.min(domains.size, 3) - (degraded ? 0.15 : 0)));
@@ -267,9 +288,13 @@ async function recommendationAgent(ctx: RunCtx, r: { detect: any; intel: any; ro
     runId: ctx.runId, decisionId: crypto.randomUUID(), severity: n ? sev : 'low', confidence, evidence, requiresHumanApproval: true, evidenceRevision: 0,
     action: n ? `Reroute ${n} vessel${n > 1 ? 's' : ''} via the Cape of Good Hope (+${Math.round(extraNm).toLocaleString()} nm, up to +${extraDays.toFixed(1)} days)` : 'No reroute required',
     reasoning: n
-      ? `${r.detect.data.lanes.length} lanes cross the Red Sea zone. Cape diversion adds up to ${extraDays.toFixed(1)} days; the tightest cold-chain slack is ${r.cold.data.worst?.slackDays.toFixed(1)} days (${risk} risk).${evidence.length ? ` Backed by ${evidence.length} retrieved source${evidence.length > 1 ? 's' : ''}.` : ' Modelled locally: no external evidence was retrieved.'}`
-      : 'No eligible vessels cross the zone.',
-    summary: { lanes: r.detect.data.lanes.length, vessels: n, extraNm, extraDays, slackDays: r.cold.data.worst?.slackDays ?? 0, risk, plans, checks: r.cold.data.checks, degraded },
+      ? `${r.detect.data.lanes.length} lanes cross the Red Sea zone. Cape diversion adds up to ${extraDays.toFixed(1)} days; the tightest cold-chain slack is ${r.cold.data.worst?.slackDays.toFixed(1)} days (${risk} risk).${evidence.length ? ` Backed by ${evidence.length} retrieved source${evidence.length > 1 ? 's' : ''}.` : ' Modelled locally: no external evidence was retrieved.'}${sensorLine}`
+      : `No eligible vessels cross the zone.${sensorLine}`,
+    summary: {
+      lanes: r.detect.data.lanes.length, vessels: n, extraNm, extraDays,
+      slackDays: r.cold.data.worst?.slackDays ?? 0, risk, plans, checks: r.cold.data.checks, degraded,
+      sensors: sensors ? { devices: sensors.devices, reefers: sensors.reefers, breaches: sensors.breaches, ambientAvg: sensors.ambientAvg, waveMax: sensors.waveMax, source: sensors.source, latencyMs: sensors.latencyMs } : null,
+    },
   };
   ctx.emit(A, 'Reroute recommendation drafted');
   return { status: 'ok' as const, data: decision, evidence, warnings: [] as string[] };
@@ -277,16 +302,17 @@ async function recommendationAgent(ctx: RunCtx, r: { detect: any; intel: any; ro
 
 /* ---------- orchestrator ---------- */
 let current: RunCtx | null = null;
-export async function assessDisruption(net: Network, onEvent?: (e: AgentRunEvent) => void, onLate?: (runId: string, e: Evidence) => void) {
+export async function assessDisruption(net: Network, onEvent?: (e: AgentRunEvent) => void, onLate?: (runId: string, e: Evidence) => void, sensors: SensorSummary | null = null) {
   current?.abort();
   const ctx = makeCtx(onEvent); current = ctx;
-  ctx.emit('Orchestrator', 'SIMULATE DISRUPTION initiated');
+  ctx.emit('Orchestrator', isDummy() ? 'SIMULATE DISRUPTION initiated — dummy data mode' : 'SIMULATE DISRUPTION initiated');
   ctx.emit('Orchestrator', 'Red Sea / Bab-el-Mandeb zone activated');
+  if (sensors) ctx.emit('Orchestrator', `Cargo IoT snapshot joined: ${sensors.devices} devices · ${sensors.source} ambient`);
   void watchResearch(ctx, e => onLate?.(ctx.runId, e));
   const detect = await detectionAgent(ctx, net);
   const intel = await intelligenceAgent(ctx);
   const route = await routePlanningAgent(ctx, detect.data);
-  const cold = await coldChainAgent(ctx, route.data, net);
+  const cold = await coldChainAgent(ctx, route.data, net, sensors);
   const rec = await recommendationAgent(ctx, { detect, intel, route, cold });
   if (ctx.signal.aborted) throw new DOMException('cancelled', 'AbortError');
   ctx.emit('Orchestrator', 'Reroute recommendation ready — operator approval required');
@@ -298,8 +324,11 @@ export function approveReroute(d: Decision, net: Network, onAudit: (a: any) => v
   const plans: any[] = d.summary.plans;
   const moved = new Set(plans.map(p => p.vesselId));
   const vessels = net.vessels.map(v => { const p = plans.find(x => x.vesselId === v.id); return moved.has(v.id) ? { ...v, route: 'cape', extraDays: p.extraDays } : v; });
-  const rer = new Set(vessels.filter(v => v.route === 'cape').map(v => v.laneId));
-  const lanes = net.lanes.map(l => (rer.has(l.id) ? { ...l, status: 'rerouted' } : l));
+  const rer = new Set(vessels.filter(v => v.route === 'cape' && v.rerouteEligible).map(v => v.laneId));
+  // Swap the geometry, not just the label: the globe draws the actual diversion.
+  const lanes = net.lanes.map(l => (rer.has(l.id) && l.alternate
+    ? { ...l, status: 'rerouted' as const, geometry: l.alternate, alternate: l.geometry }
+    : l));
   const url = d.evidence[0]?.sourceUrl;
   if (url && url.startsWith('https://')) void capture(url).then(onAudit).catch(() => {});   // audit proof, never blocks
   return { lanes, vessels, appliedDecisionIds: [...net.appliedDecisionIds, d.decisionId] };

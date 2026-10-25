@@ -6,7 +6,9 @@
     "dev": "concurrently \"vite\" \"tsx watch server/index.ts\"",
     "server": "tsx server/index.ts",
     "build": "vite build",
-    "start": "tsx server/index.ts"
+    "start": "tsx server/index.ts",
+    "test": "node --import tsx --test tests/geo.test.ts tests/predict.test.ts tests/budget.test.ts tests/net.test.ts tests/iot.test.ts tests/tf-guard.test.ts",
+    "typecheck": "tsc --noEmit -p tsconfig.json"
   },
   "dependencies": {
     "@geolibre/embed": "^3.4.0",

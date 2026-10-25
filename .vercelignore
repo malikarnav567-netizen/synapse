@@ -1,0 +1,21 @@
+# Vendored local tooling and extracted copies: not needed by the build.
+.tools/
+geolibre-src/
+extracted/
+
+# Local artifacts
+screenshots/
+*.zip
+*.log
+earth-*.png
+geolibre-*.png
+
+# Secrets never leave the machine; Vercel env vars are used at build time.
+red-sea-resilience/.env
+red-sea-resilience/.env.*
+
+# Dependencies are installed on the build machine, never uploaded.
+node_modules/
+**/node_modules/
+**/dist/
+**/.vercel/
